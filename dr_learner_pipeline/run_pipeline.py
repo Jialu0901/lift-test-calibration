@@ -176,6 +176,70 @@ def _progress(msg: str, *, verbose: bool) -> None:
         print(f"[DR pipeline] {msg}", flush=True)
 
 
+def _estimator_params_dict(model: Any) -> dict[str, Any] | None:
+    """Constructor / hyperparameter dict for sklearn-like estimators (JSON via ``default=str``)."""
+    if model is None:
+        return None
+    getp = getattr(model, "get_params", None)
+    if getp is None:
+        return {"_type": type(model).__name__, "_note": "no get_params"}
+    try:
+        return dict(getp(deep=True))
+    except Exception as e:
+        return {"_type": type(model).__name__, "_get_params_error": str(e)}
+
+
+def _save_channel_nuisance_artifacts(
+    ch_dir: Path,
+    *,
+    channel: str,
+    prop_model: Any,
+    outcome_m1: Any,
+    outcome_m0: Any,
+    prop_ok: bool,
+    prop_kind: str,
+    out_kind: str,
+    feature_names: list[str],
+    sanitized_names: list[str],
+    random_state: int,
+    n_cf_folds: int,
+) -> None:
+    """Persist refitted propensity + outcome arms used for val pseudo-outcome and downstream lead training."""
+    bundle = {
+        "propensity_model": prop_model,
+        "outcome_m1": outcome_m1,
+        "outcome_m0": outcome_m0,
+        "propensity_ok": prop_ok,
+        "best_propensity_kind": prop_kind,
+        "best_outcome_kind": out_kind,
+        "feature_names": feature_names,
+        "sanitized_names": sanitized_names,
+        "random_state": random_state,
+        "n_cf_folds": n_cf_folds,
+    }
+    joblib.dump(bundle, ch_dir / "nuisance_models.pkl")
+    meta = {
+        "channel": channel,
+        "best_propensity_kind": prop_kind,
+        "best_outcome_kind": out_kind,
+        "propensity_ok": prop_ok,
+        "random_state": random_state,
+        "n_cf_folds": n_cf_folds,
+        "n_features": len(feature_names),
+        "propensity_params": _estimator_params_dict(prop_model if prop_ok else None),
+        "outcome_m1_params": _estimator_params_dict(outcome_m1),
+        "outcome_m0_params": _estimator_params_dict(outcome_m0),
+    }
+    with open(ch_dir / "nuisance_model_params.json", "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False, default=str)
+    logger.info(
+        "Channel %s: saved nuisance_models.pkl + nuisance_model_params.json (prop=%s outcome=%s)",
+        channel,
+        prop_kind,
+        out_kind,
+    )
+
+
 def load_wide_and_split(cfg: dict, split_spec: SplitSpec) -> PipelineDataBundle:
     """
     Load the wide sample and split into train / val / test (no experiment dir, no file logging).
@@ -537,6 +601,20 @@ def run_pipeline_training_from_splits(
         )
         pseudo_va = dr_pseudo_on_split(prop_m, m1, m0, p_ok, X_va_df, T_va, Y_va)
         pseudo_va = np.nan_to_num(pseudo_va, nan=0.0, posinf=0.0, neginf=0.0)
+        _save_channel_nuisance_artifacts(
+            ch_dir,
+            channel=channel,
+            prop_model=prop_m,
+            outcome_m1=m1,
+            outcome_m0=m0,
+            prop_ok=p_ok,
+            prop_kind=pk,
+            out_kind=okind,
+            feature_names=list(feat_sel),
+            sanitized_names=list(X_tr_df.columns),
+            random_state=rs,
+            n_cf_folds=int(cfg.get("n_cf_folds", 5)),
+        )
         _progress(
             f"channel {channel}: nuisance done; Optuna lead (trials={int(cfg.get('optuna_n_trials', 15))}, may be slow)...",
             verbose=verbose,
@@ -557,10 +635,6 @@ def run_pipeline_training_from_splits(
                 json.dump(leaderboard, f, indent=2, default=str)
             with open(ch_dir / "best_model_params.json", "w", encoding="utf-8") as f:
                 json.dump(best_params, f, indent=2, default=str)
-            joblib.dump(
-                {"model": lead_model, "scaler": scaler, "feature_names": feat_sel, "sanitized_names": list(X_tr_df.columns)},
-                ch_dir / "lead_model.pkl",
-            )
             logger.info("Channel %s lead: %s params=%s", channel, fam, best_params)
             _progress(f"channel {channel}: lead OK (family={fam})", verbose=verbose)
         except Exception as e:
@@ -573,6 +647,30 @@ def run_pipeline_training_from_splits(
             X_tv = pd.concat([X_tr_df, X_va_df], axis=0)
             y_tv = np.concatenate([pseudo_tr, pseudo_va])
             lead_model.fit(X_tv, y_tv)
+
+        joblib.dump(
+            {
+                "model": lead_model,
+                "scaler": scaler,
+                "feature_names": feat_sel,
+                "sanitized_names": list(X_tr_df.columns),
+                "family": fam,
+            },
+            ch_dir / "lead_model.pkl",
+        )
+        with open(ch_dir / "lead_model_params.json", "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "family": fam,
+                    "tuning_summary": best_params,
+                    "fitted_estimator_get_params": _estimator_params_dict(lead_model),
+                    "refit_on_train_val": bool(cfg.get("refit_lead_on_train_val")),
+                },
+                f,
+                indent=2,
+                ensure_ascii=False,
+                default=str,
+            )
 
         _progress(f"channel {channel}: test predictions + metrics + placebo...", verbose=verbose)
         pred_te = lead_model.predict(X_te_df)

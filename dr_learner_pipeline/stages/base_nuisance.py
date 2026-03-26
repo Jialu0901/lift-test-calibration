@@ -27,6 +27,14 @@ logger = logging.getLogger(__name__)
 EPS = 1e-10
 
 
+def _fmt_metric(x: float) -> str:
+    return f"{x:.4f}" if x == x else "nan"
+
+
+def _fmt_mse(x: float) -> str:
+    return f"{x:.6f}" if x == x else "nan"
+
+
 def _ece(probs: np.ndarray, y: np.ndarray, n_bins: int = 10) -> float:
     """Expected calibration error (simple binning)."""
     probs = np.clip(np.asarray(probs, dtype=float).ravel(), EPS, 1 - EPS)
@@ -123,12 +131,17 @@ def score_propensity_on_val(
     T_val = np.asarray(T_val).ravel()
     n = len(T_val)
     if model is None or len(np.unique(T_val)) < 2:
-        return {"log_loss": float("nan"), "ece": float("nan")}
+        return {"log_loss": float("nan"), "ece": float("nan"), "auc": float("nan")}
     p = predict_propensity_proba(model, X_val, n)
     p = np.clip(p, EPS, 1 - EPS)
     ll = float(log_loss(T_val, p))
     ece = _ece(p, T_val)
-    return {"log_loss": ll, "ece": ece}
+    auc_p = float("nan")
+    try:
+        auc_p = float(roc_auc_score(T_val, p))
+    except Exception:
+        pass
+    return {"log_loss": ll, "ece": ece, "auc": auc_p}
 
 
 def score_outcome_pair_on_val(
@@ -186,6 +199,13 @@ def select_base_models(
         fitted = fit_propensity(m, X_tr, T_tr)
         sc = score_propensity_on_val(fitted, X_va, T_va)
         prop_scores.append({"kind": pk, **sc})
+        logger.info(
+            "Propensity candidate %s: val log_loss=%s ece=%s auc=%s",
+            pk,
+            _fmt_metric(sc["log_loss"]),
+            _fmt_metric(sc["ece"]),
+            _fmt_metric(sc["auc"]),
+        )
         if fitted is not None and sc["log_loss"] == sc["log_loss"] and sc["log_loss"] < best_ll:
             best_ll = sc["log_loss"]
             best_prop = pk
@@ -212,6 +232,12 @@ def select_base_models(
         fit_outcome_arm(m0, X_tr, Y_tr, mask0)
         sc = score_outcome_pair_on_val(m1, m0, X_va, T_va, Y_va)
         out_scores.append({"kind": ok, **sc})
+        logger.info(
+            "Outcome candidate %s: val mse=%s auc(Y vs m_T)=%s",
+            ok,
+            _fmt_mse(sc["mse"]),
+            _fmt_metric(sc["auc"]),
+        )
         if sc["mse"] < best_mse:
             best_mse = sc["mse"]
             best_ok = (ok, m1, m0)
@@ -220,12 +246,24 @@ def select_base_models(
         raise RuntimeError("No valid outcome model could be trained")
 
     ok, m1_f, m0_f = best_ok
+    best_prop_auc = float("nan")
+    for row in prop_scores:
+        if row["kind"] == best_prop:
+            best_prop_auc = float(row.get("auc", float("nan")))
+            break
+    best_out_auc = float("nan")
+    for row in out_scores:
+        if row["kind"] == ok:
+            best_out_auc = float(row.get("auc", float("nan")))
+            break
     logger.info(
-        "Base models selected: propensity=%s (val log_loss=%s), outcome=%s (val mse=%.6f)",
+        "Base models selected: propensity=%s (val log_loss=%s auc=%s), outcome=%s (val mse=%s auc=%s)",
         best_prop,
-        f"{best_ll:.4f}" if best_ll == best_ll else "nan",
+        _fmt_metric(best_ll),
+        _fmt_metric(best_prop_auc),
         ok,
-        best_mse,
+        _fmt_mse(best_mse),
+        _fmt_metric(best_out_auc),
     )
 
     return {
