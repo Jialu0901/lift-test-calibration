@@ -1,0 +1,53 @@
+# lift_wide_scaled_v1 + 全量数值候选特征（selected_features_csv: null）。
+# 与 pipeline_fixed 相同的 nuisance / lead 设定（lr+lgbm nuisance，lgbm lead，无 Optuna）。
+# Run from model_build:
+#   python -m dr_learner_pipeline.run_pipeline \
+#     --config dr_learner_pipeline/config/pipeline_scaled_v1_full_feats.yaml \
+#     --split_dates_path dr_learner_pipeline/example_split_dates.json
+
+random_seed: 42
+
+db_table: "workmagic_bi.lift_wide_scaled_v1"
+wide_table_path: null
+sample_limit: null
+chunk_days: 1
+
+channels: null
+
+output_root: "output"
+
+selected_features_csv: null
+
+feature_selection_protected_features:
+  - year
+  - month
+  - day
+  - quarter
+  - day_of_week
+  - is_weekday
+  - is_us_event
+  - event_pre_days
+  - event_post_days
+  - is_hist_order_missing
+  - is_hist_adview_missing
+feature_selection_protected_prefixes:
+  - day_name_
+  - us_event_name_
+  - us_event_type_
+  - emb_user_base_
+  - emb_event_
+
+n_cf_folds: 3
+
+propensity_candidates: ["lr"]
+outcome_candidates: ["lgbm"]
+
+optuna_n_trials: 0
+optuna_timeout: null
+lead_families: ["lgbm"]
+
+n_rank_bins: 10
+placebo_shuffle_repeats: 20
+eval_placebo_on: "val"
+
+refit_lead_on_train_val: false

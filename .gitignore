@@ -1,0 +1,18 @@
+output/
+**/output/
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+.env
+*.key
+.idea/
+.vscode/
+*.egg-info/
+.DS_Store
+# 本地数据库配置（勿提交真实密码）
+utils/db_config_local.py
+# 与 model_build 同级的 feature_engineering/db_config.json（含密钥）
+../db_config.json

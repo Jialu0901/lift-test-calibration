@@ -1,0 +1,7 @@
+{
+  "host": "your-mysql-host.example.com",
+  "user": "your_username",
+  "password": "YOUR_PASSWORD",
+  "database": "workmagic_bi",
+  "port": 3306
+}

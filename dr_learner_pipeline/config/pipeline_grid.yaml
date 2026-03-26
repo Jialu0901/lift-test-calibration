@@ -1,0 +1,57 @@
+# DR-Learner pipeline: light nuisances (lr + lgbm) + multiple lead families + Optuna.
+# Run from model_build:
+#   python -m dr_learner_pipeline.run_pipeline --config dr_learner_pipeline/config/pipeline_grid.yaml --split_dates_path ...
+
+random_seed: 42
+
+# Data source (exactly one of db_table or wide_table_path)
+db_table: "workmagic_bi.lift_wide_table_v20250310"
+wide_table_path: null
+sample_limit: null
+chunk_days: 1
+
+channels: null
+
+output_root: "output"
+
+# Feature list (paths relative to model_build unless absolute):
+# - null / omit: use all numeric candidate columns (see candidate_features_from_df)
+# - file: CSV with column selected_feature (union list for every channel)
+# - directory: <dir>/<channel>/selected_features.csv per channel; missing file -> all candidates
+selected_features_csv: null
+
+feature_selection_protected_features:
+  - year
+  - month
+  - day
+  - quarter
+  - day_of_week
+  - is_weekday
+  - is_us_event
+  - event_pre_days
+  - event_post_days
+  - is_hist_order_missing
+  - is_hist_adview_missing
+feature_selection_protected_prefixes:
+  - day_name_
+  - us_event_name_
+  - us_event_type_
+  - emb_user_base_
+  - emb_event_
+
+n_cf_folds: 3
+
+# Base nuisance: logistic propensity + LightGBM outcomes (faster than xgb/rf on wide X)
+propensity_candidates: ["lr"]
+outcome_candidates: ["lgbm"]
+
+# Lead: tune each family with Optuna on val pseudo-outcome, pick best family
+optuna_n_trials: 15
+optuna_timeout: null
+lead_families: ["lgbm", "xgb", "rf"]
+
+n_rank_bins: 10
+placebo_shuffle_repeats: 20
+eval_placebo_on: "val"
+
+refit_lead_on_train_val: false
