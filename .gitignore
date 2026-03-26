@@ -13,6 +13,7 @@ venv/
 *.egg-info/
 .DS_Store
 # 本地数据库配置（勿提交真实密码）
+db_config.json
 utils/db_config_local.py
 # 与 model_build 同级的 feature_engineering/db_config.json（含密钥）
 ../db_config.json

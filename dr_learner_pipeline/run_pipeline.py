@@ -5,7 +5,11 @@ Run from model_build directory:
   python -m dr_learner_pipeline.run_pipeline \\
     --config dr_learner_pipeline/config/pipeline_grid.yaml \\
     --split_dates_path path/to/split_dates.json \\
+    --db-config-json path/to/db_config.json \\
     --db-table your_schema.your_wide_table
+
+Notebook (same repo on sys.path): global ``DB_CONFIG`` dict → ``run_pipeline_notebook(..., db_config=DB_CONFIG)``,
+or ``db_config_json_path=`` (same effect as CLI ``--db-config-json``). See ``run_pipeline_notebook`` docstring.
 """
 from __future__ import annotations
 
@@ -15,6 +19,7 @@ import logging
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import joblib
 import numpy as np
@@ -124,39 +129,12 @@ def _prepare_X(
     return X_tr_df, X_va_df, X_te_df, None, safe
 
 
-def main() -> None:
-    p = argparse.ArgumentParser(description="Six-stage DR-Learner pipeline")
-    p.add_argument(
-        "--config",
-        type=Path,
-        default=Path(__file__).resolve().parent / "config" / "pipeline_grid.yaml",
-        help="YAML config path",
-    )
-    p.add_argument("--split_dates_path", type=Path, required=True, help="JSON with train/val/test date lists")
-    p.add_argument(
-        "--db-table",
-        dest="db_table",
-        type=str,
-        default=None,
-        help="Override YAML db_table when loading from MySQL (ignored when wide_table_path is set)",
-    )
-    p.add_argument("--output_root", type=str, default=None, help="Override output root (default from config)")
-    p.add_argument(
-        "--selected_features_csv",
-        type=Path,
-        default=None,
-        help="Override YAML selected_features_csv: omit/null = all numeric candidates; file = union CSV; dir = <dir>/<channel>/selected_features.csv",
-    )
-    args = p.parse_args()
-
-    cfg = _load_yaml(args.config)
-    if args.output_root:
-        cfg["output_root"] = args.output_root
-    if args.selected_features_csv is not None:
-        cfg["selected_features_csv"] = str(args.selected_features_csv)
-    if args.db_table is not None:
-        cfg["db_table"] = args.db_table
-
+def run_pipeline_core(
+    cfg: dict,
+    split_dates_path: Path,
+    config_yaml_path: Path,
+    cli_overrides: dict[str, Any],
+) -> Path:
     db_table = cfg.get("db_table")
     wide_path = cfg.get("wide_table_path")
     wide_ok = bool(wide_path and str(wide_path).strip())
@@ -176,13 +154,8 @@ def main() -> None:
     setup_run_logging(exp_dir / "process.log")
     logger.info("Experiment directory %s", exp_dir)
 
-    cli_overrides = {
-        k: getattr(args, k)
-        for k in ["split_dates_path", "output_root", "selected_features_csv", "db_table"]
-        if getattr(args, k, None) is not None
-    }
     write_config_backup(exp_dir, cfg, cli_overrides)
-    extra_art = [args.config, args.split_dates_path]
+    extra_art = [config_yaml_path, split_dates_path]
     csv_raw = cfg.get("selected_features_csv")
     if csv_raw and str(csv_raw).strip():
         cr = _resolve_under_model_build(csv_raw)
@@ -194,7 +167,7 @@ def main() -> None:
         extra_art,
     )
 
-    d0, d1 = date_range_for_load(args.split_dates_path)
+    d0, d1 = date_range_for_load(split_dates_path)
     limit = cfg.get("sample_limit")
     chunk_days = cfg.get("chunk_days", 1)
 
@@ -228,7 +201,7 @@ def main() -> None:
             chunk_days=chunk_days if chunk_days else None,
         )
 
-    train_df, val_df, test_df = split_train_val_test_by_dates(df, args.split_dates_path)
+    train_df, val_df, test_df = split_train_val_test_by_dates(df, split_dates_path)
     logger.info("Rows train=%d val=%d test=%d", len(train_df), len(val_df), len(test_df))
 
     cand = candidate_features_from_df(df)
@@ -568,6 +541,112 @@ def main() -> None:
         )
 
     logger.info("Done. Artifacts under %s", exp_dir)
+    return exp_dir
+
+
+def run_pipeline_notebook(
+    *,
+    config_yaml: str | Path,
+    split_dates_path: str | Path,
+    db_config: dict[str, Any] | None = None,
+    db_config_json_path: str | Path | None = None,
+    output_root: str | None = None,
+    selected_features_csv: str | Path | None = None,
+    db_table: str | None = None,
+) -> Path:
+    """
+    Run the full pipeline in-process (e.g. Jupyter). Logs go to console and output dir process.log.
+
+    Database config (at most one):
+
+    - ``db_config_json_path``: load via ``read_db_config_json(path)`` (same as CLI ``--db-config-json``).
+    - ``db_config``: dict from ``read_db_config_json`` or a literal (e.g. notebook global ``DB_CONFIG``).
+    - Both ``None``: use ``get_db_config()`` (default JSON / ``LIFT_DB_CONFIG_JSON``).
+    """
+    from utils.db_config import read_db_config_json, set_db_config_inline
+
+    if db_config_json_path is not None and db_config is not None:
+        raise ValueError("Pass at most one of db_config and db_config_json_path")
+    if db_config_json_path is not None:
+        db_config = read_db_config_json(db_config_json_path)
+    if db_config is not None:
+        set_db_config_inline(db_config)
+    config_yaml_path = Path(config_yaml).resolve()
+    split_p = Path(split_dates_path).resolve()
+    cfg = _load_yaml(config_yaml_path)
+    if output_root is not None:
+        cfg["output_root"] = output_root
+    if selected_features_csv is not None:
+        cfg["selected_features_csv"] = str(selected_features_csv)
+    if db_table is not None:
+        cfg["db_table"] = db_table
+
+    cli_overrides: dict[str, Any] = {"split_dates_path": split_p}
+    if output_root is not None:
+        cli_overrides["output_root"] = output_root
+    if selected_features_csv is not None:
+        cli_overrides["selected_features_csv"] = str(selected_features_csv)
+    if db_table is not None:
+        cli_overrides["db_table"] = db_table
+    if db_config_json_path is not None:
+        cli_overrides["db_config_json_path"] = str(Path(db_config_json_path).resolve())
+
+    return run_pipeline_core(cfg, split_p, config_yaml_path, cli_overrides)
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Six-stage DR-Learner pipeline")
+    p.add_argument(
+        "--config",
+        type=Path,
+        default=Path(__file__).resolve().parent / "config" / "pipeline_grid.yaml",
+        help="YAML config path",
+    )
+    p.add_argument("--split_dates_path", type=Path, required=True, help="JSON with train/val/test date lists")
+    p.add_argument(
+        "--db-table",
+        dest="db_table",
+        type=str,
+        default=None,
+        help="Override YAML db_table when loading from MySQL (ignored when wide_table_path is set)",
+    )
+    p.add_argument("--output_root", type=str, default=None, help="Override output root (default from config)")
+    p.add_argument(
+        "--selected_features_csv",
+        type=Path,
+        default=None,
+        help="Override YAML selected_features_csv: omit/null = all numeric candidates; file = union CSV; dir = <dir>/<channel>/selected_features.csv",
+    )
+    p.add_argument(
+        "--db-config-json",
+        dest="db_config_json",
+        type=Path,
+        default=None,
+        help="MySQL connection JSON path (host, user, password, database, port). Applied before pipeline run.",
+    )
+    args = p.parse_args()
+
+    if args.db_config_json is not None:
+        from utils.db_config import read_db_config_json, set_db_config_inline
+
+        set_db_config_inline(read_db_config_json(args.db_config_json))
+
+    cfg = _load_yaml(args.config)
+    if args.output_root:
+        cfg["output_root"] = args.output_root
+    if args.selected_features_csv is not None:
+        cfg["selected_features_csv"] = str(args.selected_features_csv)
+    if args.db_table is not None:
+        cfg["db_table"] = args.db_table
+
+    cli_overrides = {
+        k: getattr(args, k)
+        for k in ["split_dates_path", "output_root", "selected_features_csv", "db_table"]
+        if getattr(args, k, None) is not None
+    }
+    if args.db_config_json is not None:
+        cli_overrides["db_config_json"] = str(Path(args.db_config_json).resolve())
+    run_pipeline_core(cfg, args.split_dates_path, args.config, cli_overrides)
 
 
 if __name__ == "__main__":
