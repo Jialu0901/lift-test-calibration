@@ -8,9 +8,9 @@ Run from model_build directory:
     --db-config-json path/to/db_config.json \\
     --db-table your_schema.your_wide_table
 
-Notebook (same repo on sys.path): global ``DB_CONFIG`` → ``run_pipeline_notebook(...)``, or two-step
-``load_wide_and_split`` then ``run_pipeline_training_from_splits(..., verbose=True)`` to inspect ``df``/splits first.
-See module functions and ``run_pipeline_notebook`` docstring.
+Notebook: global ``DB_CONFIG``, in-memory ``split_dates`` dict, ``pipeline_overrides`` → ``run_pipeline_notebook``,
+or two-step ``load_wide_and_split`` + ``run_pipeline_training_from_splits``. Helper: ``merge_pipeline_config`` (YAML + overrides).
+CLI unchanged: ``--config``, ``--split_dates_path``, optional ``--db-config-json``.
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeAlias
 
 import joblib
 import numpy as np
@@ -44,7 +44,12 @@ from dr_learner_pipeline.metrics_total import (
     decile_r2_score,
 )
 from dr_learner_pipeline.repro import copy_artifacts, write_config_backup
-from dr_learner_pipeline.splits import date_range_for_load, split_train_val_test_by_dates
+from dr_learner_pipeline.splits import (
+    date_range_for_load,
+    date_range_for_split_dict,
+    split_train_val_test_by_dates,
+    split_train_val_test_by_dates_from_dict,
+)
 from dr_learner_pipeline.stages.base_nuisance import select_base_models
 from dr_learner_pipeline.stages.cross_fit import (
     cross_fit_pseudo_tau,
@@ -59,6 +64,29 @@ from dr_learner_pipeline.stages.eval import (
 from dr_learner_pipeline.stages.lead_optuna import select_best_lead
 
 logger = logging.getLogger(__name__)
+
+SplitSpec: TypeAlias = Path | dict[str, Any]
+
+
+def _deep_merge_dict(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge ``over`` into a copy of ``base``; dict values merge, scalars/lists replace."""
+    out: dict[str, Any] = dict(base)
+    for k, v in over.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge_dict(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def merge_pipeline_config(
+    base_cfg: dict[str, Any],
+    overrides: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Notebook helper: YAML-loaded cfg plus ``PIPELINE_OVERRIDES`` (e.g. classifier lists, optuna_n_trials)."""
+    if not overrides:
+        return dict(base_cfg)
+    return _deep_merge_dict(dict(base_cfg), overrides)
 
 
 def _load_yaml(path: Path) -> dict:
@@ -148,9 +176,12 @@ def _progress(msg: str, *, verbose: bool) -> None:
         print(f"[DR pipeline] {msg}", flush=True)
 
 
-def load_wide_and_split(cfg: dict, split_dates_path: Path) -> PipelineDataBundle:
+def load_wide_and_split(cfg: dict, split_spec: SplitSpec) -> PipelineDataBundle:
     """
     Load the wide sample and split into train / val / test (no experiment dir, no file logging).
+
+    ``split_spec`` is either a path to split JSON (CLI style) or an in-memory dict with
+    ``train`` / ``val`` / ``test`` date lists (notebook style).
 
     Use in notebooks to inspect ``df`` and split frames before calling
     :func:`run_pipeline_training_from_splits`.
@@ -165,7 +196,10 @@ def load_wide_and_split(cfg: dict, split_dates_path: Path) -> PipelineDataBundle
             "or pass --db-table for MySQL."
         )
 
-    d0, d1 = date_range_for_load(split_dates_path)
+    if isinstance(split_spec, dict):
+        d0, d1 = date_range_for_split_dict(split_spec)
+    else:
+        d0, d1 = date_range_for_load(split_spec)
     limit = cfg.get("sample_limit")
     chunk_days = cfg.get("chunk_days", 1)
 
@@ -199,7 +233,10 @@ def load_wide_and_split(cfg: dict, split_dates_path: Path) -> PipelineDataBundle
             chunk_days=chunk_days if chunk_days else None,
         )
 
-    train_df, val_df, test_df = split_train_val_test_by_dates(df, split_dates_path)
+    if isinstance(split_spec, dict):
+        train_df, val_df, test_df = split_train_val_test_by_dates_from_dict(df, split_spec)
+    else:
+        train_df, val_df, test_df = split_train_val_test_by_dates(df, split_spec)
     logger.info("Rows train=%d val=%d test=%d", len(train_df), len(val_df), len(test_df))
     return PipelineDataBundle(
         df=df,
@@ -213,7 +250,7 @@ def load_wide_and_split(cfg: dict, split_dates_path: Path) -> PipelineDataBundle
 
 def run_pipeline_training_from_splits(
     cfg: dict,
-    split_dates_path: Path,
+    split_spec: SplitSpec,
     config_yaml_path: Path,
     cli_overrides: dict[str, Any],
     bundle: PipelineDataBundle,
@@ -225,6 +262,8 @@ def run_pipeline_training_from_splits(
 
     Pass the same ``bundle`` returned by :func:`load_wide_and_split` without modifying the frames
     (especially column sets) between steps.
+
+    If ``split_spec`` is a dict, it is written to ``exp_dir / \"notebook_split_dates.json\"`` for artifacts.
     """
     rs = int(cfg.get("random_seed", 42))
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -232,12 +271,25 @@ def run_pipeline_training_from_splits(
     exp_dir = _root / out_root / ts
     exp_dir.mkdir(parents=True, exist_ok=True)
 
+    co = dict(cli_overrides)
+    if isinstance(split_spec, dict):
+        split_art_path = exp_dir / "notebook_split_dates.json"
+        split_art_path.write_text(
+            json.dumps(split_spec, indent=2, ensure_ascii=False, default=str) + "\n",
+            encoding="utf-8",
+        )
+        co["split_dates_source"] = "inline_dict"
+        co["notebook_split_dates_path"] = str(split_art_path.resolve())
+    else:
+        split_art_path = Path(split_spec).resolve()
+        co.setdefault("split_dates_path", str(split_art_path))
+
     setup_run_logging(exp_dir / "process.log")
     logger.info("Experiment directory %s", exp_dir)
     _progress(f"experiment directory: {exp_dir}", verbose=verbose)
 
-    write_config_backup(exp_dir, cfg, cli_overrides)
-    extra_art = [config_yaml_path, split_dates_path]
+    write_config_backup(exp_dir, cfg, co)
+    extra_art = [config_yaml_path, split_art_path]
     csv_raw = cfg.get("selected_features_csv")
     if csv_raw and str(csv_raw).strip():
         cr = _resolve_under_model_build(csv_raw)
@@ -648,16 +700,27 @@ def run_pipeline_core(
 def run_pipeline_notebook(
     *,
     config_yaml: str | Path,
-    split_dates_path: str | Path,
+    split_dates_path: str | Path | None = None,
+    split_dates: dict[str, Any] | None = None,
     db_config: dict[str, Any] | None = None,
     db_config_json_path: str | Path | None = None,
     output_root: str | None = None,
     selected_features_csv: str | Path | None = None,
     db_table: str | None = None,
+    pipeline_overrides: dict[str, Any] | None = None,
     progress_prints: bool = False,
 ) -> Path:
     """
     Run the full pipeline in-process (e.g. Jupyter). Logs go to console and output dir process.log.
+
+    **Splits** — pass exactly one of:
+
+    - ``split_dates_path``: path to JSON (same as CLI).
+    - ``split_dates``: in-memory dict with ``train`` / ``val`` / ``test`` date lists (no split JSON file).
+
+    **Config**: YAML from ``config_yaml``; optional ``pipeline_overrides`` deep-merged (e.g.
+    ``propensity_candidates``, ``optuna_n_trials``, ``lead_families``). Use :func:`merge_pipeline_config`
+    in two-step notebooks if you build ``cfg`` yourself.
 
     Database config (at most one):
 
@@ -665,17 +728,18 @@ def run_pipeline_notebook(
     - ``db_config``: dict from ``read_db_config_json`` or a literal (e.g. notebook global ``DB_CONFIG``).
     - Both ``None``: use ``get_db_config()`` (default JSON / ``LIFT_DB_CONFIG_JSON``).
 
-    **One-shot** (default): same as CLI — calls ``run_pipeline_core`` (no extra ``print`` beyond logging).
+    **One-shot** with ``split_dates_path``: same as CLI when ``progress_prints=False`` — ``run_pipeline_core``.
 
-    **Progress lines in the notebook**: set ``progress_prints=True`` to run load + training with
-    ``verbose=True`` (``[DR pipeline] ...`` messages on stdout).
+    **In-memory splits** (``split_dates`` dict): always uses load + training (inline split written under ``exp_dir``).
 
-    **Two-step** (inspect data before training): in separate cells, call ``load_wide_and_split(cfg, split_p)``
-    then ``run_pipeline_training_from_splits(cfg, split_p, config_yaml_path, cli_overrides, bundle, verbose=True)``.
-    Build ``cfg`` with ``_load_yaml`` and the same overrides this function applies to ``cfg`` (output_root, etc.).
+    **Progress lines**: ``progress_prints=True`` → ``verbose=True`` on training (``[DR pipeline] ...``).
+
+    **Two-step**: ``load_wide_and_split(cfg, split_spec)`` then ``run_pipeline_training_from_splits(...)``.
     """
     from utils.db_config import read_db_config_json, set_db_config_inline
 
+    if (split_dates_path is None) == (split_dates is None):
+        raise ValueError("Pass exactly one of split_dates_path or split_dates")
     if db_config_json_path is not None and db_config is not None:
         raise ValueError("Pass at most one of db_config and db_config_json_path")
     if db_config_json_path is not None:
@@ -683,8 +747,11 @@ def run_pipeline_notebook(
     if db_config is not None:
         set_db_config_inline(db_config)
     config_yaml_path = Path(config_yaml).resolve()
-    split_p = Path(split_dates_path).resolve()
+    split_spec: SplitSpec = split_dates if split_dates is not None else Path(split_dates_path).resolve()
+
     cfg = _load_yaml(config_yaml_path)
+    if pipeline_overrides is not None:
+        cfg = merge_pipeline_config(cfg, pipeline_overrides)
     if output_root is not None:
         cfg["output_root"] = output_root
     if selected_features_csv is not None:
@@ -692,7 +759,11 @@ def run_pipeline_notebook(
     if db_table is not None:
         cfg["db_table"] = db_table
 
-    cli_overrides: dict[str, Any] = {"split_dates_path": split_p}
+    cli_overrides: dict[str, Any] = {}
+    if split_dates_path is not None:
+        cli_overrides["split_dates_path"] = str(Path(split_dates_path).resolve())
+    if split_dates is not None:
+        cli_overrides["split_dates_source"] = "inline_dict"
     if output_root is not None:
         cli_overrides["output_root"] = output_root
     if selected_features_csv is not None:
@@ -702,12 +773,18 @@ def run_pipeline_notebook(
     if db_config_json_path is not None:
         cli_overrides["db_config_json_path"] = str(Path(db_config_json_path).resolve())
 
-    if progress_prints:
-        bundle = load_wide_and_split(cfg, split_p)
+    use_inline_split = split_dates is not None
+    if progress_prints or use_inline_split:
+        bundle = load_wide_and_split(cfg, split_spec)
         return run_pipeline_training_from_splits(
-            cfg, split_p, config_yaml_path, cli_overrides, bundle, verbose=True
+            cfg,
+            split_spec,
+            config_yaml_path,
+            cli_overrides,
+            bundle,
+            verbose=progress_prints,
         )
-    return run_pipeline_core(cfg, split_p, config_yaml_path, cli_overrides)
+    return run_pipeline_core(cfg, Path(split_dates_path).resolve(), config_yaml_path, cli_overrides)
 
 
 def main() -> None:

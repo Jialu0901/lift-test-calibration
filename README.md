@@ -27,6 +27,13 @@ python -m dr_learner_pipeline.run_pipeline \
 
 其他配置见 `dr_learner_pipeline/config/`（如 `pipeline_fixed.yaml`、`pipeline_scaled_v1_full_feats.yaml`）。
 
+### Notebook：内存 split 与超参覆盖
+
+- **命令行 / 本地脚本**：继续使用 **`--config`**（YAML 路径）和 **`--split_dates_path`**（JSON 路径），行为与上文一致。
+- **Notebook**：可将日期划分写成内存里的 **`SPLIT_DATES`** dict；流水线参数可用 **`PIPELINE_CONFIG`**（完整 dict，等价于 YAML）+ 可选 **`PIPELINE_OVERRIDES`**，再 **`merge_pipeline_config`** → **`load_wide_and_split`** / **`run_pipeline_training_from_splits`**（见 **`notebooks/run_dr_learner_from_github.ipynb`**，可不读仓库内 `pipeline_grid.yaml`）。若仍希望以 YAML 为基底，也可用 **`merge_pipeline_config(_load_yaml(...), PIPELINE_OVERRIDES)`**。训练阶段若 `split_spec` 为 dict，会在本次实验目录写入 **`notebook_split_dates.json`** 便于复现。一键入口 **`run_pipeline_notebook`** 支持 **`split_dates=`** 与 **`pipeline_overrides=`**（与 **`split_dates_path=`** 二选一，见 `dr_learner_pipeline/run_pipeline.py` 中的说明）。
+
+示例见 **`notebooks/run_dr_learner_from_github.ipynb`**（GitHub 克隆场景）与 **`dr_learner_pipeline/notebook/run_dr_learner_pipeline.ipynb`**（monorepo 内 `MODEL_BUILD`）。
+
 ## 数据库配置（JSON，勿提交密钥）
 
 - MySQL 连接仅从 **JSON** 读取，由 `utils/db_config.py` 解析（**不**再依赖 `src2`）。

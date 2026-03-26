@@ -1,8 +1,9 @@
-"""Train / Val / Test split by outcome_date lists (JSON)."""
+"""Train / Val / Test split by outcome_date lists (JSON file or in-memory dict)."""
 from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -27,22 +28,36 @@ def _norm_date_list(xs: list) -> list[str]:
     return out
 
 
-def split_train_val_test_by_dates(
-    df: pd.DataFrame,
-    path: str | Path,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    JSON keys: train, val, test — each a list of date strings.
-    Lists must be pairwise disjoint.
-    """
-    path = Path(path)
-    raw = json.loads(path.read_text(encoding="utf-8"))
+def _coerce_split_dates_dict(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError(f"split_dates must be a JSON object, got {type(raw).__name__}")
     for k in ("train", "val", "test"):
         if k not in raw:
-            raise ValueError(f"split_dates JSON must contain '{k}' key")
+            raise ValueError(f"split_dates must contain '{k}' key")
+    return raw
 
+
+def date_range_for_split_dict(raw: dict[str, Any]) -> tuple[str, str]:
+    """Min/max date across train+val+test lists for SQL date_range."""
+    raw = _coerce_split_dates_dict(raw)
+    all_dates: list[str] = []
+    for k in ("train", "val", "test"):
+        all_dates.extend(_norm_date_list(raw[k]))
+    if not all_dates:
+        raise ValueError("No dates in split spec")
+    sorted_d = sorted(all_dates)
+    return sorted_d[0], sorted_d[-1]
+
+
+def split_train_val_test_by_dates_from_dict(
+    df: pd.DataFrame,
+    raw: dict[str, Any],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Same semantics as :func:`split_train_val_test_by_dates` but ``raw`` is already a dict
+    (e.g. from notebook ``SPLIT_DATES``).
+    """
+    raw = _coerce_split_dates_dict(raw)
     train_dates = set(_norm_date_list(raw["train"]))
     val_dates = set(_norm_date_list(raw["val"]))
     test_dates = set(_norm_date_list(raw["test"]))
@@ -86,14 +101,21 @@ def split_train_val_test_by_dates(
     return train_df, val_df, test_df
 
 
+def split_train_val_test_by_dates(
+    df: pd.DataFrame,
+    path: str | Path,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    JSON keys: train, val, test — each a list of date strings.
+    Lists must be pairwise disjoint.
+    """
+    path = Path(path)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    return split_train_val_test_by_dates_from_dict(df, raw)
+
+
 def date_range_for_load(split_path: str | Path) -> tuple[str, str]:
     """Min/max date across train+val+test lists for SQL date_range."""
     path = Path(split_path)
     raw = json.loads(path.read_text(encoding="utf-8"))
-    all_dates: list[str] = []
-    for k in ("train", "val", "test"):
-        all_dates.extend(_norm_date_list(raw[k]))
-    if not all_dates:
-        raise ValueError("No dates in split file")
-    sorted_d = sorted(all_dates)
-    return sorted_d[0], sorted_d[-1]
+    return date_range_for_split_dict(raw)
