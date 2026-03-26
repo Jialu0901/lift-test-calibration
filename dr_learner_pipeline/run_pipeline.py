@@ -8,8 +8,9 @@ Run from model_build directory:
     --db-config-json path/to/db_config.json \\
     --db-table your_schema.your_wide_table
 
-Notebook (same repo on sys.path): global ``DB_CONFIG`` dict → ``run_pipeline_notebook(..., db_config=DB_CONFIG)``,
-or ``db_config_json_path=`` (same effect as CLI ``--db-config-json``). See ``run_pipeline_notebook`` docstring.
+Notebook (same repo on sys.path): global ``DB_CONFIG`` → ``run_pipeline_notebook(...)``, or two-step
+``load_wide_and_split`` then ``run_pipeline_training_from_splits(..., verbose=True)`` to inspect ``df``/splits first.
+See module functions and ``run_pipeline_notebook`` docstring.
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ import argparse
 import json
 import logging
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -129,12 +131,30 @@ def _prepare_X(
     return X_tr_df, X_va_df, X_te_df, None, safe
 
 
-def run_pipeline_core(
-    cfg: dict,
-    split_dates_path: Path,
-    config_yaml_path: Path,
-    cli_overrides: dict[str, Any],
-) -> Path:
+@dataclass(frozen=True)
+class PipelineDataBundle:
+    """Output of :func:`load_wide_and_split` for notebook step 1 (inspect before training)."""
+
+    df: pd.DataFrame
+    train_df: pd.DataFrame
+    val_df: pd.DataFrame
+    test_df: pd.DataFrame
+    date_load_start: str
+    date_load_end: str
+
+
+def _progress(msg: str, *, verbose: bool) -> None:
+    if verbose:
+        print(f"[DR pipeline] {msg}", flush=True)
+
+
+def load_wide_and_split(cfg: dict, split_dates_path: Path) -> PipelineDataBundle:
+    """
+    Load the wide sample and split into train / val / test (no experiment dir, no file logging).
+
+    Use in notebooks to inspect ``df`` and split frames before calling
+    :func:`run_pipeline_training_from_splits`.
+    """
     db_table = cfg.get("db_table")
     wide_path = cfg.get("wide_table_path")
     wide_ok = bool(wide_path and str(wide_path).strip())
@@ -144,28 +164,6 @@ def run_pipeline_core(
             "Data source not configured: set wide_table_path in YAML for parquet, or set db_table in YAML "
             "or pass --db-table for MySQL."
         )
-
-    rs = int(cfg.get("random_seed", 42))
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_root = Path(cfg.get("output_root", "output"))
-    exp_dir = _root / out_root / ts
-    exp_dir.mkdir(parents=True, exist_ok=True)
-
-    setup_run_logging(exp_dir / "process.log")
-    logger.info("Experiment directory %s", exp_dir)
-
-    write_config_backup(exp_dir, cfg, cli_overrides)
-    extra_art = [config_yaml_path, split_dates_path]
-    csv_raw = cfg.get("selected_features_csv")
-    if csv_raw and str(csv_raw).strip():
-        cr = _resolve_under_model_build(csv_raw)
-        if cr.is_file() or cr.is_dir():
-            extra_art.append(cr)
-    copy_artifacts(
-        exp_dir,
-        Path(__file__).resolve(),
-        extra_art,
-    )
 
     d0, d1 = date_range_for_load(split_dates_path)
     limit = cfg.get("sample_limit")
@@ -203,6 +201,71 @@ def run_pipeline_core(
 
     train_df, val_df, test_df = split_train_val_test_by_dates(df, split_dates_path)
     logger.info("Rows train=%d val=%d test=%d", len(train_df), len(val_df), len(test_df))
+    return PipelineDataBundle(
+        df=df,
+        train_df=train_df,
+        val_df=val_df,
+        test_df=test_df,
+        date_load_start=d0,
+        date_load_end=d1,
+    )
+
+
+def run_pipeline_training_from_splits(
+    cfg: dict,
+    split_dates_path: Path,
+    config_yaml_path: Path,
+    cli_overrides: dict[str, Any],
+    bundle: PipelineDataBundle,
+    *,
+    verbose: bool = False,
+) -> Path:
+    """
+    Experiment dir, logging, feature resolution, per-channel training, and total-ITE metrics.
+
+    Pass the same ``bundle`` returned by :func:`load_wide_and_split` without modifying the frames
+    (especially column sets) between steps.
+    """
+    rs = int(cfg.get("random_seed", 42))
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_root = Path(cfg.get("output_root", "output"))
+    exp_dir = _root / out_root / ts
+    exp_dir.mkdir(parents=True, exist_ok=True)
+
+    setup_run_logging(exp_dir / "process.log")
+    logger.info("Experiment directory %s", exp_dir)
+    _progress(f"experiment directory: {exp_dir}", verbose=verbose)
+
+    write_config_backup(exp_dir, cfg, cli_overrides)
+    extra_art = [config_yaml_path, split_dates_path]
+    csv_raw = cfg.get("selected_features_csv")
+    if csv_raw and str(csv_raw).strip():
+        cr = _resolve_under_model_build(csv_raw)
+        if cr.is_file() or cr.is_dir():
+            extra_art.append(cr)
+    copy_artifacts(
+        exp_dir,
+        Path(__file__).resolve(),
+        extra_art,
+    )
+
+    df = bundle.df
+    train_df = bundle.train_df
+    val_df = bundle.val_df
+    test_df = bundle.test_df
+    logger.info(
+        "Training phase: rows train=%d val=%d test=%d (load range %s .. %s)",
+        len(train_df),
+        len(val_df),
+        len(test_df),
+        bundle.date_load_start,
+        bundle.date_load_end,
+    )
+    _progress(
+        f"training phase: train={len(train_df)} val={len(val_df)} test={len(test_df)} "
+        f"(loaded {bundle.date_load_start} .. {bundle.date_load_end})",
+        verbose=verbose,
+    )
 
     cand = candidate_features_from_df(df)
     prot_explicit = list(cfg.get("feature_selection_protected_features") or [])
@@ -309,19 +372,26 @@ def run_pipeline_core(
 
     test_preds_by_ch: dict[str, np.ndarray] = {}
     id_cols = [c for c in ["outcome_date", "tenant_id", "user_id"] if c in test_df.columns]
+    _progress(
+        f"feature lists resolved (mode={feature_mode!r}); iterating {len(ch_list)} channel(s)",
+        verbose=verbose,
+    )
 
     for channel in ch_list:
         t_col = f"T_{channel}"
         if t_col not in train_df.columns:
             logger.warning("Skip %s: no %s", channel, t_col)
+            _progress(f"skip channel {channel}: missing {t_col}", verbose=verbose)
             continue
         T_tr = train_df[t_col].values
         if T_tr.sum() == 0 or T_tr.sum() == len(T_tr):
             logger.warning("Skip %s: T degenerate on train", channel)
+            _progress(f"skip channel {channel}: treatment degenerate on train", verbose=verbose)
             continue
 
         ch_dir = exp_dir / channel
         ch_dir.mkdir(parents=True, exist_ok=True)
+        _progress(f"channel {channel}: start", verbose=verbose)
 
         if feature_mode == "csv_dir_per_channel" and feat_sel_per_channel is not None:
             feat_sel = feat_sel_per_channel[channel]
@@ -355,6 +425,7 @@ def run_pipeline_core(
         )
         (ch_dir / "selected_features.txt").write_text("\n".join(feat_sel) + "\n", encoding="utf-8")
         logger.info("Channel %s feature list: %s", channel, fs_meta)
+        _progress(f"channel {channel}: n_features={len(feat_sel)}; nuisance/base selection...", verbose=verbose)
 
         X_tr_df, X_va_df, X_te_df, scaler, _safe = _prepare_X(train_df, val_df, test_df, feat_sel)
         Y_tr = train_df["Y"].values.astype(float)
@@ -389,10 +460,15 @@ def run_pipeline_core(
                 )
         except Exception as e:
             logger.exception("Base model selection failed %s: %s", channel, e)
+            _progress(f"channel {channel}: FAILED nuisance/base selection ({e!r})", verbose=verbose)
             continue
 
         pk = base["best_propensity_kind"]
         okind = base["best_outcome_kind"]
+        _progress(
+            f"channel {channel}: cross-fit pseudo-outcome + refit nuisance (prop={pk} outcome={okind})...",
+            verbose=verbose,
+        )
         pseudo_tr = cross_fit_pseudo_tau(
             X_tr_df,
             T_tr,
@@ -409,6 +485,10 @@ def run_pipeline_core(
         )
         pseudo_va = dr_pseudo_on_split(prop_m, m1, m0, p_ok, X_va_df, T_va, Y_va)
         pseudo_va = np.nan_to_num(pseudo_va, nan=0.0, posinf=0.0, neginf=0.0)
+        _progress(
+            f"channel {channel}: nuisance done; Optuna lead (trials={int(cfg.get('optuna_n_trials', 15))}, may be slow)...",
+            verbose=verbose,
+        )
 
         try:
             lead_model, fam, best_params, leaderboard = select_best_lead(
@@ -430,15 +510,19 @@ def run_pipeline_core(
                 ch_dir / "lead_model.pkl",
             )
             logger.info("Channel %s lead: %s params=%s", channel, fam, best_params)
+            _progress(f"channel {channel}: lead OK (family={fam})", verbose=verbose)
         except Exception as e:
             logger.exception("Lead training failed %s: %s", channel, e)
+            _progress(f"channel {channel}: FAILED Optuna lead ({e!r})", verbose=verbose)
             continue
 
         if cfg.get("refit_lead_on_train_val"):
+            _progress(f"channel {channel}: refit lead on train+val", verbose=verbose)
             X_tv = pd.concat([X_tr_df, X_va_df], axis=0)
             y_tv = np.concatenate([pseudo_tr, pseudo_va])
             lead_model.fit(X_tv, y_tv)
 
+        _progress(f"channel {channel}: test predictions + metrics + placebo...", verbose=verbose)
         pred_te = lead_model.predict(X_te_df)
         test_preds_by_ch[channel] = pred_te
 
@@ -464,7 +548,10 @@ def run_pipeline_core(
             with open(ch_dir / "placebo_report.json", "w", encoding="utf-8") as f:
                 json.dump(pb, f, indent=2)
 
+        _progress(f"channel {channel}: done", verbose=verbose)
+
     # ----- Total ITE on test -----
+    _progress("channel loop finished; aggregating total ITE (if any predictions)...", verbose=verbose)
     if test_preds_by_ch:
         n_te = len(test_df)
         ite_total = np.zeros(n_te, dtype=float)
@@ -541,7 +628,21 @@ def run_pipeline_core(
         )
 
     logger.info("Done. Artifacts under %s", exp_dir)
+    _progress(f"all done -> {exp_dir}", verbose=verbose)
     return exp_dir
+
+
+def run_pipeline_core(
+    cfg: dict,
+    split_dates_path: Path,
+    config_yaml_path: Path,
+    cli_overrides: dict[str, Any],
+) -> Path:
+    """Load data, split, then training + artifacts (CLI / one-shot). No extra stdout beyond logging."""
+    bundle = load_wide_and_split(cfg, split_dates_path)
+    return run_pipeline_training_from_splits(
+        cfg, split_dates_path, config_yaml_path, cli_overrides, bundle, verbose=False
+    )
 
 
 def run_pipeline_notebook(
@@ -553,6 +654,7 @@ def run_pipeline_notebook(
     output_root: str | None = None,
     selected_features_csv: str | Path | None = None,
     db_table: str | None = None,
+    progress_prints: bool = False,
 ) -> Path:
     """
     Run the full pipeline in-process (e.g. Jupyter). Logs go to console and output dir process.log.
@@ -562,6 +664,15 @@ def run_pipeline_notebook(
     - ``db_config_json_path``: load via ``read_db_config_json(path)`` (same as CLI ``--db-config-json``).
     - ``db_config``: dict from ``read_db_config_json`` or a literal (e.g. notebook global ``DB_CONFIG``).
     - Both ``None``: use ``get_db_config()`` (default JSON / ``LIFT_DB_CONFIG_JSON``).
+
+    **One-shot** (default): same as CLI — calls ``run_pipeline_core`` (no extra ``print`` beyond logging).
+
+    **Progress lines in the notebook**: set ``progress_prints=True`` to run load + training with
+    ``verbose=True`` (``[DR pipeline] ...`` messages on stdout).
+
+    **Two-step** (inspect data before training): in separate cells, call ``load_wide_and_split(cfg, split_p)``
+    then ``run_pipeline_training_from_splits(cfg, split_p, config_yaml_path, cli_overrides, bundle, verbose=True)``.
+    Build ``cfg`` with ``_load_yaml`` and the same overrides this function applies to ``cfg`` (output_root, etc.).
     """
     from utils.db_config import read_db_config_json, set_db_config_inline
 
@@ -591,6 +702,11 @@ def run_pipeline_notebook(
     if db_config_json_path is not None:
         cli_overrides["db_config_json_path"] = str(Path(db_config_json_path).resolve())
 
+    if progress_prints:
+        bundle = load_wide_and_split(cfg, split_p)
+        return run_pipeline_training_from_splits(
+            cfg, split_p, config_yaml_path, cli_overrides, bundle, verbose=True
+        )
     return run_pipeline_core(cfg, split_p, config_yaml_path, cli_overrides)
 
 
