@@ -40,6 +40,7 @@ def load_and_build_sample(
     wide_parquet: str | Path | None = None,
     sample_limit: int | None = None,
     chunk_days: int | None = 1,
+    sample_weight_column: str | None = None,
 ) -> pd.DataFrame:
     """
     Load raw wide rows with outcome_date in [date_start, date_end], then build_sample_from_wide_df.
@@ -65,7 +66,7 @@ def load_and_build_sample(
             (pd.to_datetime(raw["outcome_date"], errors="coerce") >= pd.Timestamp(d0))
             & (pd.to_datetime(raw["outcome_date"], errors="coerce") <= pd.Timestamp(d1))
         ]
-        return build_sample_from_wide_df(raw)
+        return build_sample_from_wide_df(raw, sample_weight_column=sample_weight_column)
 
     raw = load_wide_table_from_db(
         table_name=db_table,
@@ -73,4 +74,4 @@ def load_and_build_sample(
         date_range=(d0, d1),
         chunk_days=chunk_days if chunk_days else None,
     )
-    return build_sample_from_wide_df(raw)
+    return build_sample_from_wide_df(raw, sample_weight_column=sample_weight_column)

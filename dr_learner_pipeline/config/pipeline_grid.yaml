@@ -4,6 +4,10 @@
 
 random_seed: 42
 
+# Optional per-row weights (wide table column); off by default. When true, nuisances + lead use sample_weight.
+use_sample_weight: false
+sample_weight_column: "sample_weight"
+
 # Data source (exactly one of db_table or wide_table_path)
 db_table: "workmagic_bi.lift_wide_table_v20250310"
 wide_table_path: null

@@ -41,6 +41,7 @@ def _fit_nuisance_bundle(
     prop_kind: str,
     out_kind: str,
     random_state: int,
+    sample_weight: np.ndarray | None = None,
 ):
     T = np.asarray(T).ravel()
     Y = np.asarray(Y, dtype=float).ravel()
@@ -49,13 +50,13 @@ def _fit_nuisance_bundle(
     prop_fitted = None
     if pk and pk != "none":
         prop = make_propensity(prop_kind, random_state)
-        prop_fitted = fit_propensity(prop, X_df, T)
+        prop_fitted = fit_propensity(prop, X_df, T, sample_weight=sample_weight)
     m1 = make_outcome(out_kind, random_state)
     m0 = make_outcome(out_kind, random_state)
     mask1 = T == 1
     mask0 = T == 0
-    fit_outcome_arm(m1, X_df, Y, mask1)
-    fit_outcome_arm(m0, X_df, Y, mask0)
+    fit_outcome_arm(m1, X_df, Y, mask1, sample_weight=sample_weight)
+    fit_outcome_arm(m0, X_df, Y, mask0, sample_weight=sample_weight)
     ok = prop_fitted is not None
     return prop_fitted, m1, m0, ok
 
@@ -69,6 +70,7 @@ def cross_fit_pseudo_tau(
     out_kind: str,
     n_cf_folds: int,
     random_state: int,
+    sample_weight: np.ndarray | None = None,
 ) -> np.ndarray:
     n = len(X_df)
     T = np.asarray(T).ravel()
@@ -77,7 +79,9 @@ def cross_fit_pseudo_tau(
     k = _effective_k(n, n_cf_folds, T)
 
     if k <= 1:
-        prop, m1, m0, ok = _fit_nuisance_bundle(X_df, T, Y, prop_kind, out_kind, random_state)
+        prop, m1, m0, ok = _fit_nuisance_bundle(
+            X_df, T, Y, prop_kind, out_kind, random_state, sample_weight=sample_weight
+        )
         e = predict_propensity_proba(prop, X_df, n) if ok else np.full(n, 0.5)
         e = np.clip(e, EPS, 1 - EPS)
         m1p = m1.predict(X_df)
@@ -92,8 +96,11 @@ def cross_fit_pseudo_tau(
         X_val = X_df.iloc[val_idx]
         T_val = T[val_idx]
         Y_val = Y[val_idx]
+        sw_tr = None
+        if sample_weight is not None:
+            sw_tr = np.asarray(sample_weight, dtype=float).ravel()[train_idx]
         prop, m1, m0, ok = _fit_nuisance_bundle(
-            X_tr, T_tr, Y_tr, prop_kind, out_kind, random_state + fold_id
+            X_tr, T_tr, Y_tr, prop_kind, out_kind, random_state + fold_id, sample_weight=sw_tr
         )
         e_val = predict_propensity_proba(prop, X_val, len(val_idx))
         if not ok:
@@ -113,9 +120,12 @@ def refit_nuisance_full_train(
     prop_kind: str,
     out_kind: str,
     random_state: int,
+    sample_weight: np.ndarray | None = None,
 ):
     """Refit nuisances on all training rows (for Val pseudo targets)."""
-    return _fit_nuisance_bundle(X_df, T, Y, prop_kind, out_kind, random_state)
+    return _fit_nuisance_bundle(
+        X_df, T, Y, prop_kind, out_kind, random_state, sample_weight=sample_weight
+    )
 
 
 def dr_pseudo_on_split(

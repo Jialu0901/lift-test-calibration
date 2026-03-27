@@ -1,16 +1,15 @@
 """
-Six-stage DR-Learner experiment pipeline entrypoint.
+S-Learner experiment pipeline (CausalML BaseSRegressor + Optuna).
 
 Run from model_build directory:
-  python -m dr_learner_pipeline.run_pipeline \\
-    --config dr_learner_pipeline/config/pipeline_grid.yaml \\
+  python -m s_learner_pipeline.run_pipeline \\
+    --config s_learner_pipeline/config/pipeline_s_learner.yaml \\
     --split_dates_path path/to/split_dates.json \\
     --db-config-json path/to/db_config.json \\
     --db-table your_schema.your_wide_table
 
-Notebook: global ``DB_CONFIG``, in-memory ``split_dates`` dict, ``pipeline_overrides`` → ``run_pipeline_notebook``,
-or two-step ``load_wide_and_split`` + ``run_pipeline_training_from_splits``. Helper: ``merge_pipeline_config`` (YAML + overrides).
-CLI unchanged: ``--config``, ``--split_dates_path``, optional ``--db-config-json``.
+Notebook: ``DB_CONFIG``, ``split_dates`` dict, ``PIPELINE_CONFIG`` / overrides →
+``load_wide_and_split`` + ``run_pipeline_training_from_splits`` or ``run_pipeline_notebook``.
 """
 from __future__ import annotations
 
@@ -36,36 +35,29 @@ from utils.dr_model import _sanitize_feature_names
 from utils.uplift_feature_selection import merge_csv_and_protected_features, resolve_protected_features
 from utils.wide_sample_pipeline import candidate_features_from_df, load_and_build_sample
 
-from dr_learner_pipeline.logging_utils import setup_run_logging
-from dr_learner_pipeline.metrics_total import (
+from s_learner_pipeline.logging_utils import setup_run_logging
+from s_learner_pipeline.metrics_total import (
     conversion_by_bins,
     conversion_qini_vs_random,
     cumulative_conversion_curve,
     decile_r2_score,
 )
-from dr_learner_pipeline.repro import copy_artifacts, write_config_backup
-from dr_learner_pipeline.splits import (
+from s_learner_pipeline.repro import copy_artifacts, write_config_backup
+from s_learner_pipeline.splits import (
     date_range_for_load,
     date_range_for_split_dict,
     split_train_val_test_by_dates,
     split_train_val_test_by_dates_from_dict,
 )
-from dr_learner_pipeline.stages.base_nuisance import (
-    EPS as PROP_SCORE_EPS,
-    predict_propensity_proba,
-    select_base_models,
-)
-from dr_learner_pipeline.stages.cross_fit import (
-    cross_fit_pseudo_tau,
-    dr_pseudo_on_split,
-    refit_nuisance_full_train,
-)
-from dr_learner_pipeline.stages.eval import (
+from s_learner_pipeline.stages.eval import (
+    evaluate_channel_test,
     placebo_shuffle_t,
     save_conversion_rank_plot,
-    evaluate_channel_test,
 )
-from dr_learner_pipeline.stages.lead_optuna import select_best_lead
+from s_learner_pipeline.stages.slearner_tune import (
+    refit_slearner_train_val_from_params,
+    select_best_slearner,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +65,6 @@ SplitSpec: TypeAlias = Path | dict[str, Any]
 
 
 def _deep_merge_dict(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
-    """Recursively merge ``over`` into a copy of ``base``; dict values merge, scalars/lists replace."""
     out: dict[str, Any] = dict(base)
     for k, v in over.items():
         if isinstance(v, dict) and isinstance(out.get(k), dict):
@@ -87,7 +78,6 @@ def merge_pipeline_config(
     base_cfg: dict[str, Any],
     overrides: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Notebook helper: YAML-loaded cfg plus ``PIPELINE_OVERRIDES`` (e.g. classifier lists, optuna_n_trials)."""
     if not overrides:
         return dict(base_cfg)
     return _deep_merge_dict(dict(base_cfg), overrides)
@@ -148,7 +138,6 @@ def _prepare_X(
     test_df: pd.DataFrame,
     feat_cols: list[str],
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, None, list[str]]:
-    """Build X matrices: fillna(0), float, sanitize names. No StandardScaler (wide table is pre-scaled upstream)."""
     X_tr = train_df[feat_cols].fillna(0).astype(float)
     X_va = val_df[feat_cols].fillna(0).astype(float)
     X_te = test_df[feat_cols].fillna(0).astype(float)
@@ -163,22 +152,61 @@ def _prepare_X(
     return X_tr_df, X_va_df, X_te_df, None, safe
 
 
-def _sanitize_sample_weights(series: pd.Series, *, context: str) -> np.ndarray:
-    """fillna(1), clip below eps; log warnings when fixing NaN or non-positive values."""
-    s = pd.to_numeric(series, errors="coerce")
-    if s.isna().any():
-        logger.warning("[%s] sample_weight had NaN; filled with 1.0", context)
-        s = s.fillna(1.0)
-    w = s.to_numpy(dtype=float)
-    if np.any(w <= 0):
-        logger.warning("[%s] sample_weight had non-positive values; clipped to 1e-12", context)
-    return np.clip(w, 1e-12, None)
+def _parse_row_weights(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    cfg: dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool, str | None]:
+    """
+    One set of row weights for the whole run (all channels). Returns (w_tr, w_va, w_te, active, column_name).
+    """
+    use_sw = bool(cfg.get("use_sample_weight", True))
+    col = str(cfg.get("sample_weight_column") or "sample_weight")
+    n1, n2, n3 = len(train_df), len(val_df), len(test_df)
+    ones_tr = np.ones(n1, dtype=np.float64)
+    ones_va = np.ones(n2, dtype=np.float64)
+    ones_te = np.ones(n3, dtype=np.float64)
+    if not use_sw:
+        return ones_tr, ones_va, ones_te, False, None
+    if col not in train_df.columns or col not in val_df.columns or col not in test_df.columns:
+        logger.info(
+            "use_sample_weight true but column %r missing on a split; using unit weights",
+            col,
+        )
+        return ones_tr, ones_va, ones_te, False, col
+
+    def one(d: pd.DataFrame) -> np.ndarray:
+        w = pd.to_numeric(d[col], errors="coerce").fillna(1.0).to_numpy(dtype=np.float64)
+        w = np.where(np.isfinite(w) & (w > 0), w, 1.0)
+        return w
+
+    w_tr, w_va, w_te = one(train_df), one(val_df), one(test_df)
+    return w_tr, w_va, w_te, True, col
+
+
+def _predict_slearner(m: Any, X_df: pd.DataFrame) -> np.ndarray:
+    X = np.asarray(X_df, dtype=np.float64)
+    try:
+        out = m.predict(X)
+    except TypeError:
+        out = m.predict(X=X)
+    arr = np.asarray(out, dtype=np.float64)
+    if arr.ndim == 2 and arr.shape[1] >= 1:
+        return arr[:, 0].ravel()
+    return arr.ravel()
+
+
+def _inner_fitted_estimator(slearner: Any) -> Any:
+    for attr in ("model", "_model", "estimator"):
+        o = getattr(slearner, attr, None)
+        if o is not None:
+            return o
+    return slearner
 
 
 @dataclass(frozen=True)
 class PipelineDataBundle:
-    """Output of :func:`load_wide_and_split` for notebook step 1 (inspect before training)."""
-
     df: pd.DataFrame
     train_df: pd.DataFrame
     val_df: pd.DataFrame
@@ -189,11 +217,10 @@ class PipelineDataBundle:
 
 def _progress(msg: str, *, verbose: bool) -> None:
     if verbose:
-        print(f"[DR pipeline] {msg}", flush=True)
+        print(f"[S pipeline] {msg}", flush=True)
 
 
 def _estimator_params_dict(model: Any) -> dict[str, Any] | None:
-    """Constructor / hyperparameter dict for sklearn-like estimators (JSON via ``default=str``)."""
     if model is None:
         return None
     getp = getattr(model, "get_params", None)
@@ -205,67 +232,7 @@ def _estimator_params_dict(model: Any) -> dict[str, Any] | None:
         return {"_type": type(model).__name__, "_get_params_error": str(e)}
 
 
-def _save_channel_nuisance_artifacts(
-    ch_dir: Path,
-    *,
-    channel: str,
-    prop_model: Any,
-    outcome_m1: Any,
-    outcome_m0: Any,
-    prop_ok: bool,
-    prop_kind: str,
-    out_kind: str,
-    feature_names: list[str],
-    sanitized_names: list[str],
-    random_state: int,
-    n_cf_folds: int,
-) -> None:
-    """Persist refitted propensity + outcome arms used for val pseudo-outcome and downstream lead training."""
-    bundle = {
-        "propensity_model": prop_model,
-        "outcome_m1": outcome_m1,
-        "outcome_m0": outcome_m0,
-        "propensity_ok": prop_ok,
-        "best_propensity_kind": prop_kind,
-        "best_outcome_kind": out_kind,
-        "feature_names": feature_names,
-        "sanitized_names": sanitized_names,
-        "random_state": random_state,
-        "n_cf_folds": n_cf_folds,
-    }
-    joblib.dump(bundle, ch_dir / "nuisance_models.pkl")
-    meta = {
-        "channel": channel,
-        "best_propensity_kind": prop_kind,
-        "best_outcome_kind": out_kind,
-        "propensity_ok": prop_ok,
-        "random_state": random_state,
-        "n_cf_folds": n_cf_folds,
-        "n_features": len(feature_names),
-        "propensity_params": _estimator_params_dict(prop_model if prop_ok else None),
-        "outcome_m1_params": _estimator_params_dict(outcome_m1),
-        "outcome_m0_params": _estimator_params_dict(outcome_m0),
-    }
-    with open(ch_dir / "nuisance_model_params.json", "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2, ensure_ascii=False, default=str)
-    logger.info(
-        "Channel %s: saved nuisance_models.pkl + nuisance_model_params.json (prop=%s outcome=%s)",
-        channel,
-        prop_kind,
-        out_kind,
-    )
-
-
 def load_wide_and_split(cfg: dict, split_spec: SplitSpec) -> PipelineDataBundle:
-    """
-    Load the wide sample and split into train / val / test (no experiment dir, no file logging).
-
-    ``split_spec`` is either a path to split JSON (CLI style) or an in-memory dict with
-    ``train`` / ``val`` / ``test`` date lists (notebook style).
-
-    Use in notebooks to inspect ``df`` and split frames before calling
-    :func:`run_pipeline_training_from_splits`.
-    """
     db_table = cfg.get("db_table")
     wide_path = cfg.get("wide_table_path")
     wide_ok = bool(wide_path and str(wide_path).strip())
@@ -294,10 +261,6 @@ def load_wide_and_split(cfg: dict, split_spec: SplitSpec) -> PipelineDataBundle:
             ", ".join(_obsolete_fs),
         )
 
-    use_sw = bool(cfg.get("use_sample_weight"))
-    sw_col = str(cfg.get("sample_weight_column") or "sample_weight").strip() or "sample_weight"
-    sw_kw = sw_col if use_sw else None
-
     if wide_ok:
         df = load_and_build_sample(
             d0,
@@ -306,7 +269,6 @@ def load_wide_and_split(cfg: dict, split_spec: SplitSpec) -> PipelineDataBundle:
             wide_parquet=Path(str(wide_path).strip()),
             sample_limit=limit,
             chunk_days=chunk_days if chunk_days else None,
-            sample_weight_column=sw_kw,
         )
     else:
         df = load_and_build_sample(
@@ -316,7 +278,6 @@ def load_wide_and_split(cfg: dict, split_spec: SplitSpec) -> PipelineDataBundle:
             wide_parquet=None,
             sample_limit=limit,
             chunk_days=chunk_days if chunk_days else None,
-            sample_weight_column=sw_kw,
         )
 
     if isinstance(split_spec, dict):
@@ -343,14 +304,6 @@ def run_pipeline_training_from_splits(
     *,
     verbose: bool = False,
 ) -> Path:
-    """
-    Experiment dir, logging, feature resolution, per-channel training, and total-ITE metrics.
-
-    Pass the same ``bundle`` returned by :func:`load_wide_and_split` without modifying the frames
-    (especially column sets) between steps.
-
-    If ``split_spec`` is a dict, it is written to ``exp_dir / \"notebook_split_dates.json\"`` for artifacts.
-    """
     rs = int(cfg.get("random_seed", 42))
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_root = Path(cfg.get("output_root", "output"))
@@ -405,18 +358,21 @@ def run_pipeline_training_from_splits(
         verbose=verbose,
     )
 
-    use_sample_weight = bool(cfg.get("use_sample_weight"))
-    sw_src = str(cfg.get("sample_weight_column") or "sample_weight").strip() or "sample_weight"
-    if use_sample_weight:
-        if "sample_weight" not in train_df.columns:
-            raise ValueError(
-                "use_sample_weight is True but built sample has no 'sample_weight' column. "
-                f"Ensure the wide table includes column {sw_src!r} (see sample_weight_column in config)."
-            )
-        sw_tr = _sanitize_sample_weights(train_df["sample_weight"], context="train")
-        sw_va = _sanitize_sample_weights(val_df["sample_weight"], context="val")
-    else:
-        sw_tr = sw_va = None
+    w_tr, w_va, w_te, weights_active, sw_col = _parse_row_weights(train_df, val_df, test_df, cfg)
+    (exp_dir / "sample_weight_run_meta.json").write_text(
+        json.dumps(
+            {
+                "use_sample_weight_config": bool(cfg.get("use_sample_weight", True)),
+                "sample_weight_column": sw_col,
+                "weights_active": weights_active,
+                "sum_w_train": float(np.sum(w_tr)),
+                "sum_w_val": float(np.sum(w_va)),
+                "sum_w_test": float(np.sum(w_te)),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
     cand = candidate_features_from_df(df)
     prot_explicit = list(cfg.get("feature_selection_protected_features") or [])
@@ -521,10 +477,14 @@ def run_pipeline_training_from_splits(
                 f"selected_features_csv must be a file, an existing directory, or empty/null: {resolved}"
             )
 
+    w_tr_arg = w_tr if weights_active else None
+    w_va_arg = w_va if weights_active else None
+
     test_preds_by_ch: dict[str, np.ndarray] = {}
     id_cols = [c for c in ["outcome_date", "tenant_id", "user_id"] if c in test_df.columns]
     _progress(
-        f"feature lists resolved (mode={feature_mode!r}); iterating {len(ch_list)} channel(s)",
+        f"feature lists resolved (mode={feature_mode!r}); weights_active={weights_active}; "
+        f"iterating {len(ch_list)} channel(s)",
         verbose=verbose,
     )
 
@@ -576,7 +536,6 @@ def run_pipeline_training_from_splits(
         )
         (ch_dir / "selected_features.txt").write_text("\n".join(feat_sel) + "\n", encoding="utf-8")
         logger.info("Channel %s feature list: %s", channel, fs_meta)
-        _progress(f"channel {channel}: n_features={len(feat_sel)}; nuisance/base selection...", verbose=verbose)
 
         X_tr_df, X_va_df, X_te_df, scaler, _safe = _prepare_X(train_df, val_df, test_df, feat_sel)
         Y_tr = train_df["Y"].values.astype(float)
@@ -585,112 +544,51 @@ def run_pipeline_training_from_splits(
         T_va = val_df[t_col].values
         T_te = test_df[t_col].values
 
+        _progress(
+            f"channel {channel}: Optuna S-learner (trials={int(cfg.get('optuna_n_trials', 15))})...",
+            verbose=verbose,
+        )
         try:
-            base = select_base_models(
+            lead_model, fam, best_params, leaderboard = select_best_slearner(
                 X_tr_df,
                 T_tr,
                 Y_tr,
+                w_tr_arg,
                 X_va_df,
                 T_va,
                 Y_va,
-                list(cfg.get("propensity_candidates", ["lr", "xgb"])),
-                list(cfg.get("outcome_candidates", ["lgbm", "rf"])),
-                rs,
-                sample_weight_tr=sw_tr,
-                sample_weight_va=sw_va,
-            )
-            with open(ch_dir / "base_model_scores.json", "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "propensity_scores": base["propensity_scores"],
-                        "outcome_scores": base["outcome_scores"],
-                        "best_propensity_kind": base["best_propensity_kind"],
-                        "best_outcome_kind": base["best_outcome_kind"],
-                    },
-                    f,
-                    indent=2,
-                    default=str,
-                )
-        except Exception as e:
-            logger.exception("Base model selection failed %s: %s", channel, e)
-            _progress(f"channel {channel}: FAILED nuisance/base selection ({e!r})", verbose=verbose)
-            continue
-
-        pk = base["best_propensity_kind"]
-        okind = base["best_outcome_kind"]
-        _progress(
-            f"channel {channel}: cross-fit pseudo-outcome + refit nuisance (prop={pk} outcome={okind})...",
-            verbose=verbose,
-        )
-        pseudo_tr = cross_fit_pseudo_tau(
-            X_tr_df,
-            T_tr,
-            Y_tr,
-            prop_kind=pk,
-            out_kind=okind,
-            n_cf_folds=int(cfg.get("n_cf_folds", 5)),
-            random_state=rs,
-            sample_weight=sw_tr,
-        )
-        pseudo_tr = np.nan_to_num(pseudo_tr, nan=0.0, posinf=0.0, neginf=0.0)
-
-        prop_m, m1, m0, p_ok = refit_nuisance_full_train(
-            X_tr_df, T_tr, Y_tr, pk, okind, rs, sample_weight=sw_tr
-        )
-        pseudo_va = dr_pseudo_on_split(prop_m, m1, m0, p_ok, X_va_df, T_va, Y_va)
-        pseudo_va = np.nan_to_num(pseudo_va, nan=0.0, posinf=0.0, neginf=0.0)
-        _save_channel_nuisance_artifacts(
-            ch_dir,
-            channel=channel,
-            prop_model=prop_m,
-            outcome_m1=m1,
-            outcome_m0=m0,
-            prop_ok=p_ok,
-            prop_kind=pk,
-            out_kind=okind,
-            feature_names=list(feat_sel),
-            sanitized_names=list(X_tr_df.columns),
-            random_state=rs,
-            n_cf_folds=int(cfg.get("n_cf_folds", 5)),
-        )
-        _progress(
-            f"channel {channel}: nuisance done; Optuna lead (trials={int(cfg.get('optuna_n_trials', 15))}, may be slow)...",
-            verbose=verbose,
-        )
-
-        try:
-            lead_model, fam, best_params, leaderboard = select_best_lead(
-                X_tr_df,
-                pseudo_tr,
-                X_va_df,
-                pseudo_va,
-                list(cfg.get("lead_families", ["lgbm", "xgb", "rf"])),
+                w_va_arg,
+                list(cfg.get("learner_families", ["lgbm", "xgb", "rf"])),
                 int(cfg.get("optuna_n_trials", 15)),
                 rs,
                 cfg.get("optuna_timeout"),
-                sample_weight_tr=sw_tr,
-                sample_weight_va=sw_va,
             )
             with open(ch_dir / "lead_leaderboard.json", "w", encoding="utf-8") as f:
                 json.dump(leaderboard, f, indent=2, default=str)
             with open(ch_dir / "best_model_params.json", "w", encoding="utf-8") as f:
                 json.dump(best_params, f, indent=2, default=str)
-            logger.info("Channel %s lead: %s params=%s", channel, fam, best_params)
-            _progress(f"channel {channel}: lead OK (family={fam})", verbose=verbose)
+            logger.info("Channel %s S-learner: %s params=%s", channel, fam, best_params)
+            _progress(f"channel {channel}: S-learner OK (family={fam})", verbose=verbose)
         except Exception as e:
-            logger.exception("Lead training failed %s: %s", channel, e)
-            _progress(f"channel {channel}: FAILED Optuna lead ({e!r})", verbose=verbose)
+            logger.exception("S-learner training failed %s: %s", channel, e)
+            _progress(f"channel {channel}: FAILED S-learner ({e!r})", verbose=verbose)
             continue
 
-        if cfg.get("refit_lead_on_train_val"):
-            _progress(f"channel {channel}: refit lead on train+val", verbose=verbose)
-            X_tv = pd.concat([X_tr_df, X_va_df], axis=0)
-            y_tv = np.concatenate([pseudo_tr, pseudo_va])
-            if sw_tr is not None and sw_va is not None:
-                w_tv = np.concatenate([sw_tr, sw_va])
-                lead_model.fit(X_tv, y_tv, sample_weight=w_tv)
-            else:
-                lead_model.fit(X_tv, y_tv)
+        if cfg.get("refit_on_train_val"):
+            _progress(f"channel {channel}: refit S-learner on train+val", verbose=verbose)
+            lead_model = refit_slearner_train_val_from_params(
+                fam,
+                best_params,
+                X_tr_df,
+                X_va_df,
+                T_tr,
+                T_va,
+                Y_tr,
+                Y_va,
+                w_tr_arg,
+                w_va_arg,
+                rs,
+            )
 
         joblib.dump(
             {
@@ -699,6 +597,8 @@ def run_pipeline_training_from_splits(
                 "feature_names": feat_sel,
                 "sanitized_names": list(X_tr_df.columns),
                 "family": fam,
+                "use_sample_weight": weights_active,
+                "sample_weight_column": sw_col if weights_active else None,
             },
             ch_dir / "lead_model.pkl",
         )
@@ -707,10 +607,12 @@ def run_pipeline_training_from_splits(
                 {
                     "family": fam,
                     "tuning_summary": best_params,
-                    "fitted_estimator_get_params": _estimator_params_dict(lead_model),
-                    "refit_on_train_val": bool(cfg.get("refit_lead_on_train_val")),
-                    "use_sample_weight": use_sample_weight,
-                    "sample_weight_column": sw_src if use_sample_weight else None,
+                    "use_sample_weight": weights_active,
+                    "sample_weight_column": sw_col if weights_active else None,
+                    "fitted_estimator_get_params": _estimator_params_dict(
+                        _inner_fitted_estimator(lead_model)
+                    ),
+                    "refit_on_train_val": bool(cfg.get("refit_on_train_val")),
                 },
                 f,
                 indent=2,
@@ -719,7 +621,7 @@ def run_pipeline_training_from_splits(
             )
 
         _progress(f"channel {channel}: test predictions + metrics + placebo...", verbose=verbose)
-        pred_te = lead_model.predict(X_te_df)
+        pred_te = _predict_slearner(lead_model, X_te_df)
         test_preds_by_ch[channel] = pred_te
 
         id_df = test_df[id_cols].copy() if id_cols else pd.DataFrame(index=test_df.index)
@@ -727,19 +629,15 @@ def run_pipeline_training_from_splits(
         out_te["Y"] = Y_te
         out_te[t_col] = T_te
         out_te["pred_ite"] = pred_te
-        if p_ok and prop_m is not None:
-            e_te = predict_propensity_proba(prop_m, X_te_df, len(T_te))
-            e_te = np.clip(e_te, PROP_SCORE_EPS, 1.0 - PROP_SCORE_EPS)
-        else:
-            e_te = np.full(len(T_te), 0.5, dtype=float)
-        out_te["propensity_score"] = e_te
+        if weights_active and sw_col:
+            out_te["sample_weight"] = w_te
         out_te.to_csv(ch_dir / "test_predictions.csv", index=False)
 
         evaluate_channel_test(pred_te, T_te, Y_te, ch_dir, channel)
 
         eval_on = str(cfg.get("eval_placebo_on", "val"))
         if eval_on == "val":
-            pred_va = lead_model.predict(X_va_df)
+            pred_va = _predict_slearner(lead_model, X_va_df)
             pb = placebo_shuffle_t(
                 pred_va,
                 T_va,
@@ -752,7 +650,6 @@ def run_pipeline_training_from_splits(
 
         _progress(f"channel {channel}: done", verbose=verbose)
 
-    # ----- Total ITE on test -----
     _progress("channel loop finished; aggregating total ITE (if any predictions)...", verbose=verbose)
     if test_preds_by_ch:
         n_te = len(test_df)
@@ -764,12 +661,11 @@ def run_pipeline_training_from_splits(
             ite_total += arr
         total_df = test_df[id_cols].copy() if id_cols else pd.DataFrame(index=test_df.index)
         total_df["Y"] = test_df["Y"].values
-        for col in test_df.columns:
-            if str(col).startswith("T_"):
-                total_df[col] = test_df[col].values
         for c, arr in test_preds_by_ch.items():
             total_df[f"pred_ite_{c}"] = arr
         total_df["ITE_total"] = ite_total
+        if weights_active and sw_col:
+            total_df["sample_weight"] = w_te
         total_df.to_csv(exp_dir / "test_predictions_total.csv", index=False)
 
         y_te = test_df["Y"].values.astype(float)
@@ -843,7 +739,6 @@ def run_pipeline_core(
     config_yaml_path: Path,
     cli_overrides: dict[str, Any],
 ) -> Path:
-    """Load data, split, then training + artifacts (CLI / one-shot). No extra stdout beyond logging."""
     bundle = load_wide_and_split(cfg, split_dates_path)
     return run_pipeline_training_from_splits(
         cfg, split_dates_path, config_yaml_path, cli_overrides, bundle, verbose=False
@@ -862,39 +757,7 @@ def run_pipeline_notebook(
     db_table: str | None = None,
     pipeline_overrides: dict[str, Any] | None = None,
     progress_prints: bool = False,
-    use_sample_weight: bool | None = None,
-    sample_weight_column: str | None = None,
 ) -> Path:
-    """
-    Run the full pipeline in-process (e.g. Jupyter). Logs go to console and output dir process.log.
-
-    **Splits** — pass exactly one of:
-
-    - ``split_dates_path``: path to JSON (same as CLI).
-    - ``split_dates``: in-memory dict with ``train`` / ``val`` / ``test`` date lists (no split JSON file).
-
-    **Config**: YAML from ``config_yaml``; optional ``pipeline_overrides`` deep-merged (e.g.
-    ``propensity_candidates``, ``optuna_n_trials``, ``lead_families``). Use :func:`merge_pipeline_config`
-    in two-step notebooks if you build ``cfg`` yourself.
-
-    Database config (at most one):
-
-    - ``db_config_json_path``: load via ``read_db_config_json(path)`` (same as CLI ``--db-config-json``).
-    - ``db_config``: dict from ``read_db_config_json`` or a literal (e.g. notebook global ``DB_CONFIG``).
-    - Both ``None``: use ``get_db_config()`` (default JSON / ``LIFT_DB_CONFIG_JSON``).
-
-    **One-shot** with ``split_dates_path``: same as CLI when ``progress_prints=False`` — ``run_pipeline_core``.
-
-    **In-memory splits** (``split_dates`` dict): always uses load + training (inline split written under ``exp_dir``).
-
-    **Progress lines**: ``progress_prints=True`` → ``verbose=True`` on training (``[DR pipeline] ...``).
-
-    **Sample weights**: optional ``use_sample_weight`` / ``sample_weight_column`` (merged into ``cfg`` after
-    YAML; same keys as ``pipeline_overrides``). In notebooks you can instead set globals and pass
-    ``pipeline_overrides={\"use_sample_weight\": USE_SAMPLE_WEIGHT, ...}``.
-
-    **Two-step**: ``load_wide_and_split(cfg, split_spec)`` then ``run_pipeline_training_from_splits(...)``.
-    """
     from utils.db_config import read_db_config_json, set_db_config_inline
 
     if (split_dates_path is None) == (split_dates is None):
@@ -911,10 +774,6 @@ def run_pipeline_notebook(
     cfg = _load_yaml(config_yaml_path)
     if pipeline_overrides is not None:
         cfg = merge_pipeline_config(cfg, pipeline_overrides)
-    if use_sample_weight is not None:
-        cfg["use_sample_weight"] = bool(use_sample_weight)
-    if sample_weight_column is not None:
-        cfg["sample_weight_column"] = str(sample_weight_column)
     if output_root is not None:
         cfg["output_root"] = output_root
     if selected_features_csv is not None:
@@ -935,10 +794,6 @@ def run_pipeline_notebook(
         cli_overrides["db_table"] = db_table
     if db_config_json_path is not None:
         cli_overrides["db_config_json_path"] = str(Path(db_config_json_path).resolve())
-    if use_sample_weight is not None:
-        cli_overrides["use_sample_weight"] = bool(use_sample_weight)
-    if sample_weight_column is not None:
-        cli_overrides["sample_weight_column"] = str(sample_weight_column)
 
     use_inline_split = split_dates is not None
     if progress_prints or use_inline_split:
@@ -955,11 +810,11 @@ def run_pipeline_notebook(
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Six-stage DR-Learner pipeline")
+    p = argparse.ArgumentParser(description="S-Learner pipeline (CausalML + Optuna)")
     p.add_argument(
         "--config",
         type=Path,
-        default=Path(__file__).resolve().parent / "config" / "pipeline_grid.yaml",
+        default=Path(__file__).resolve().parent / "config" / "pipeline_s_learner.yaml",
         help="YAML config path",
     )
     p.add_argument("--split_dates_path", type=Path, required=True, help="JSON with train/val/test date lists")
@@ -975,25 +830,14 @@ def main() -> None:
         "--selected_features_csv",
         type=Path,
         default=None,
-        help="Override YAML selected_features_csv: omit/null = all numeric candidates; file = union CSV; dir = <dir>/<channel>/selected_features.csv",
+        help="Override YAML selected_features_csv",
     )
     p.add_argument(
         "--db-config-json",
         dest="db_config_json",
         type=Path,
         default=None,
-        help="MySQL connection JSON path (host, user, password, database, port). Applied before pipeline run.",
-    )
-    p.add_argument(
-        "--use-sample-weight",
-        action="store_true",
-        help="Enable training with per-row weights from wide table (see sample_weight_column in YAML)",
-    )
-    p.add_argument(
-        "--sample-weight-column",
-        type=str,
-        default=None,
-        help="Override YAML sample_weight_column (wide table column name, stored as sample_weight in sample)",
+        help="MySQL connection JSON path",
     )
     args = p.parse_args()
 
@@ -1009,20 +853,12 @@ def main() -> None:
         cfg["selected_features_csv"] = str(args.selected_features_csv)
     if args.db_table is not None:
         cfg["db_table"] = args.db_table
-    if args.use_sample_weight:
-        cfg["use_sample_weight"] = True
-    if args.sample_weight_column is not None:
-        cfg["sample_weight_column"] = args.sample_weight_column
 
     cli_overrides = {
         k: getattr(args, k)
         for k in ["split_dates_path", "output_root", "selected_features_csv", "db_table"]
         if getattr(args, k, None) is not None
     }
-    if args.use_sample_weight:
-        cli_overrides["use_sample_weight"] = True
-    if args.sample_weight_column is not None:
-        cli_overrides["sample_weight_column"] = args.sample_weight_column
     if args.db_config_json is not None:
         cli_overrides["db_config_json"] = str(Path(args.db_config_json).resolve())
     run_pipeline_core(cfg, args.split_dates_path, args.config, cli_overrides)

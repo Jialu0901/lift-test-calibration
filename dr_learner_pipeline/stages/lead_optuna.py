@@ -37,6 +37,28 @@ def _mse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(mean_squared_error(y_true, y_pred))
 
 
+def _val_mse(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    sample_weight: np.ndarray | None,
+) -> float:
+    y_true = np.asarray(y_true, dtype=float).ravel()
+    y_pred = np.asarray(y_pred, dtype=float).ravel()
+    if sample_weight is None:
+        return _mse(y_true, y_pred)
+    w = np.asarray(sample_weight, dtype=float).ravel()
+    den = float(np.sum(w))
+    if den <= 0:
+        return float("inf")
+    return float(np.sum(w * (y_true - y_pred) ** 2) / den)
+
+
+def _fit_sample_weight_kw(sample_weight_tr: np.ndarray | None) -> dict[str, np.ndarray]:
+    if sample_weight_tr is None:
+        return {}
+    return {"sample_weight": np.asarray(sample_weight_tr, dtype=float).ravel()}
+
+
 def tune_and_fit_lgbm(
     X_tr: pd.DataFrame,
     pseudo_tr: np.ndarray,
@@ -45,6 +67,8 @@ def tune_and_fit_lgbm(
     n_trials: int,
     random_state: int,
     timeout: float | None,
+    sample_weight_tr: np.ndarray | None = None,
+    sample_weight_va: np.ndarray | None = None,
 ) -> tuple[Any, dict]:
     if not HAS_LGB:
         raise ImportError("lightgbm required")
@@ -59,12 +83,13 @@ def tune_and_fit_lgbm(
             **p,
         )
 
+    fkw = _fit_sample_weight_kw(sample_weight_tr)
     if not HAS_OPTUNA or n_trials <= 0:
         p = dict(n_estimators=150, max_depth=6, learning_rate=0.08, num_leaves=31)
         m = default_model(p)
-        m.fit(X_tr, pseudo_tr)
+        m.fit(X_tr, pseudo_tr, **fkw)
         pred = m.predict(X_va)
-        return m, {**p, "val_mse": _mse(pseudo_va, pred)}
+        return m, {**p, "val_mse": _val_mse(pseudo_va, pred, sample_weight_va)}
 
     def objective(trial: "optuna.Trial") -> float:
         p = {
@@ -74,16 +99,16 @@ def tune_and_fit_lgbm(
             "num_leaves": trial.suggest_int("num_leaves", 16, 128),
         }
         m = default_model(p)
-        m.fit(X_tr, pseudo_tr)
+        m.fit(X_tr, pseudo_tr, **fkw)
         pred = m.predict(X_va)
-        return _mse(pseudo_va, pred)
+        return _val_mse(pseudo_va, pred, sample_weight_va)
 
     study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=random_state))
     study.optimize(objective, n_trials=n_trials, timeout=timeout, show_progress_bar=False)
     best_params = study.best_params.copy()
     best_mse = float(study.best_value)
     best_model = default_model(best_params)
-    best_model.fit(X_tr, pseudo_tr)
+    best_model.fit(X_tr, pseudo_tr, **fkw)
     best_params["val_mse"] = best_mse
     return best_model, best_params
 
@@ -96,6 +121,8 @@ def tune_and_fit_xgb(
     n_trials: int,
     random_state: int,
     timeout: float | None,
+    sample_weight_tr: np.ndarray | None = None,
+    sample_weight_va: np.ndarray | None = None,
 ) -> tuple[Any, dict]:
     if not HAS_XGB:
         raise ImportError("xgboost required")
@@ -107,12 +134,13 @@ def tune_and_fit_xgb(
             **p,
         )
 
+    fkw = _fit_sample_weight_kw(sample_weight_tr)
     if not HAS_OPTUNA or n_trials <= 0:
         p = dict(n_estimators=150, max_depth=5, learning_rate=0.08, subsample=0.9)
         m = default_model(p)
-        m.fit(X_tr, pseudo_tr)
+        m.fit(X_tr, pseudo_tr, **fkw)
         pred = m.predict(X_va)
-        return m, {**p, "val_mse": _mse(pseudo_va, pred)}
+        return m, {**p, "val_mse": _val_mse(pseudo_va, pred, sample_weight_va)}
 
     def objective(trial: "optuna.Trial") -> float:
         p = {
@@ -123,16 +151,16 @@ def tune_and_fit_xgb(
             "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
         }
         m = default_model(p)
-        m.fit(X_tr, pseudo_tr)
+        m.fit(X_tr, pseudo_tr, **fkw)
         pred = m.predict(X_va)
-        return _mse(pseudo_va, pred)
+        return _val_mse(pseudo_va, pred, sample_weight_va)
 
     study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=random_state))
     study.optimize(objective, n_trials=n_trials, timeout=timeout, show_progress_bar=False)
     best_params = study.best_params.copy()
     best_mse = float(study.best_value)
     best_model = default_model(best_params)
-    best_model.fit(X_tr, pseudo_tr)
+    best_model.fit(X_tr, pseudo_tr, **fkw)
     best_params["val_mse"] = best_mse
     return best_model, best_params
 
@@ -145,17 +173,20 @@ def tune_and_fit_rf(
     n_trials: int,
     random_state: int,
     timeout: float | None,
+    sample_weight_tr: np.ndarray | None = None,
+    sample_weight_va: np.ndarray | None = None,
 ) -> tuple[Any, dict]:
     def default_model(p: dict) -> Any:
         return RandomForestRegressor(**p)
 
+    fkw = _fit_sample_weight_kw(sample_weight_tr)
     if not HAS_OPTUNA or n_trials <= 0:
         p = dict(n_estimators=150, max_depth=10, min_samples_leaf=5, random_state=random_state)
         m = default_model(p)
-        m.fit(X_tr, pseudo_tr)
+        m.fit(X_tr, pseudo_tr, **fkw)
         pred = m.predict(X_va)
         out = {k: v for k, v in p.items() if k != "random_state"}
-        out["val_mse"] = _mse(pseudo_va, pred)
+        out["val_mse"] = _val_mse(pseudo_va, pred, sample_weight_va)
         return m, out
 
     def objective(trial: "optuna.Trial") -> float:
@@ -166,16 +197,16 @@ def tune_and_fit_rf(
             "random_state": random_state,
         }
         m = default_model(p)
-        m.fit(X_tr, pseudo_tr)
+        m.fit(X_tr, pseudo_tr, **fkw)
         pred = m.predict(X_va)
-        return _mse(pseudo_va, pred)
+        return _val_mse(pseudo_va, pred, sample_weight_va)
 
     study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=random_state))
     study.optimize(objective, n_trials=n_trials, timeout=timeout, show_progress_bar=False)
     best_params = study.best_params.copy()
     best_mse = float(study.best_value)
     best_model = RandomForestRegressor(**best_params, random_state=random_state)
-    best_model.fit(X_tr, pseudo_tr)
+    best_model.fit(X_tr, pseudo_tr, **fkw)
     best_params["val_mse"] = best_mse
     return best_model, best_params
 
@@ -189,6 +220,8 @@ def select_best_lead(
     n_trials: int,
     random_state: int,
     timeout: float | None,
+    sample_weight_tr: np.ndarray | None = None,
+    sample_weight_va: np.ndarray | None = None,
 ) -> tuple[Any, str, dict, list[dict]]:
     """
     Returns (model, winning_family, best_params_dict, leaderboard).
@@ -212,7 +245,15 @@ def select_best_lead(
             continue
         try:
             m, params = runners[fam](
-                X_tr, pseudo_tr, X_va, pseudo_va, n_trials, random_state, timeout
+                X_tr,
+                pseudo_tr,
+                X_va,
+                pseudo_va,
+                n_trials,
+                random_state,
+                timeout,
+                sample_weight_tr,
+                sample_weight_va,
             )
         except Exception as e:
             logger.warning("Lead family %s failed: %s", fam, e)

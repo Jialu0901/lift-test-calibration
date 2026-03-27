@@ -1,0 +1,48 @@
+# S-Learner pipeline: CausalML BaseSRegressor + Optuna on learner_families.
+# Run from model_build:
+#   python -m s_learner_pipeline.run_pipeline --config s_learner_pipeline/config/pipeline_s_learner.yaml --split_dates_path ...
+
+random_seed: 42
+
+# Row-level supervision weights (same w_tr/w_va/w_te for every channel in one run).
+use_sample_weight: true
+sample_weight_column: "sample_weight"
+
+db_table: "workmagic_bi.lift_wide_scaled_v1"
+wide_table_path: null
+sample_limit: null
+chunk_days: 1
+
+channels: null
+
+output_root: "output"
+
+selected_features_csv: null
+
+feature_selection_protected_features:
+  - year
+  - month
+  - day
+  - quarter
+  - day_of_week
+  - is_weekday
+  - is_us_event
+  - event_pre_days
+  - event_post_days
+  - is_hist_order_missing
+  - is_hist_adview_missing
+feature_selection_protected_prefixes:
+  - day_name_
+  - us_event_name_
+  - us_event_type_
+  - emb_user_base_
+  - emb_event_
+
+learner_families: ["lgbm", "xgb", "rf", "elasticnet"]
+optuna_n_trials: 15
+optuna_timeout: null
+refit_on_train_val: false
+
+n_rank_bins: 10
+placebo_shuffle_repeats: 20
+eval_placebo_on: "val"

@@ -9,10 +9,17 @@ import pandas as pd
 from utils.config import CHANNELS, TARGET, build_treatment, get_feature_columns_from_df
 
 
-def build_sample_from_wide_df(df: pd.DataFrame) -> pd.DataFrame:
+def build_sample_from_wide_df(
+    df: pd.DataFrame,
+    *,
+    sample_weight_column: str | None = None,
+) -> pd.DataFrame:
     """
     从宽表 DataFrame（parquet 或 DB）构建建模样本：id + X + T_* + Y。
     与 MODELING_DATA_SPEC 一致。
+
+    If ``sample_weight_column`` is set, that column must exist on ``df``; values are copied as float
+    into a unified ``sample_weight`` column (sanitized during training).
     """
     if df.empty:
         raise ValueError("Empty wide_table")
@@ -34,4 +41,12 @@ def build_sample_from_wide_df(df: pd.DataFrame) -> pd.DataFrame:
     id_avail = [c for c in id_cols if c in df.columns]
     sample = df[id_avail].copy() if id_avail else pd.DataFrame(index=df.index)
     sample = pd.concat([sample, X, df[t_cols], Y], axis=1)
+    if sample_weight_column:
+        if sample_weight_column not in df.columns:
+            raise ValueError(
+                f"sample_weight_column={sample_weight_column!r} not found in wide table columns"
+            )
+        sample["sample_weight"] = pd.to_numeric(df[sample_weight_column], errors="coerce").astype(
+            float
+        )
     return sample

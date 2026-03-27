@@ -97,11 +97,19 @@ def make_outcome(kind: str, random_state: int) -> Any:
     raise ValueError(f"Unknown outcome kind: {kind}")
 
 
-def fit_propensity(model: Any, X: pd.DataFrame, T: np.ndarray) -> Any:
+def fit_propensity(
+    model: Any,
+    X: pd.DataFrame,
+    T: np.ndarray,
+    sample_weight: np.ndarray | None = None,
+) -> Any:
     T = np.asarray(T).ravel()
     if len(np.unique(T)) < 2:
         return None
-    model.fit(X, T)
+    kw: dict[str, Any] = {}
+    if sample_weight is not None:
+        kw["sample_weight"] = np.asarray(sample_weight, dtype=float).ravel()
+    model.fit(X, T, **kw)
     return model
 
 
@@ -114,10 +122,47 @@ def predict_propensity_proba(model: Any | None, X: pd.DataFrame, n: int) -> np.n
     return p.ravel().astype(float)
 
 
-def fit_outcome_arm(model: Any, X: pd.DataFrame, Y: np.ndarray, mask: np.ndarray) -> Any:
+def evaluate_propensity_predictions(
+    p: np.ndarray,
+    T: np.ndarray,
+    sample_weight: np.ndarray | None = None,
+) -> dict[str, float]:
+    """log_loss / ece / auc for clipped P(T=1|X) vs binary T (same convention as val scoring).
+
+    When ``sample_weight`` is set, only ``log_loss`` uses weights; ECE and AUC stay unweighted.
+    """
+    T = np.asarray(T).ravel().astype(int)
+    if len(T) == 0 or len(np.unique(T)) < 2:
+        return {"log_loss": float("nan"), "ece": float("nan"), "auc": float("nan")}
+    p = np.clip(np.asarray(p, dtype=float).ravel(), EPS, 1.0 - EPS)
+    if sample_weight is not None:
+        sw = np.asarray(sample_weight, dtype=float).ravel()
+        ll = float(log_loss(T, p, sample_weight=sw))
+    else:
+        ll = float(log_loss(T, p))
+    ece = float(_ece(p, T))
+    auc_p = float("nan")
+    try:
+        auc_p = float(roc_auc_score(T, p))
+    except Exception:
+        pass
+    return {"log_loss": ll, "ece": ece, "auc": auc_p}
+
+
+def fit_outcome_arm(
+    model: Any,
+    X: pd.DataFrame,
+    Y: np.ndarray,
+    mask: np.ndarray,
+    sample_weight: np.ndarray | None = None,
+) -> Any:
     mask = np.asarray(mask, dtype=bool)
     if mask.sum() > 0:
-        model.fit(X.iloc[np.flatnonzero(mask)], Y[mask])
+        idx = np.flatnonzero(mask)
+        kw: dict[str, Any] = {}
+        if sample_weight is not None:
+            kw["sample_weight"] = np.asarray(sample_weight, dtype=float).ravel()[mask]
+        model.fit(X.iloc[idx], Y[mask], **kw)
     else:
         model.fit(X, np.zeros(len(Y)))
     return model
@@ -127,21 +172,14 @@ def score_propensity_on_val(
     model: Any | None,
     X_val: pd.DataFrame,
     T_val: np.ndarray,
+    sample_weight_val: np.ndarray | None = None,
 ) -> dict[str, float]:
     T_val = np.asarray(T_val).ravel()
     n = len(T_val)
     if model is None or len(np.unique(T_val)) < 2:
         return {"log_loss": float("nan"), "ece": float("nan"), "auc": float("nan")}
     p = predict_propensity_proba(model, X_val, n)
-    p = np.clip(p, EPS, 1 - EPS)
-    ll = float(log_loss(T_val, p))
-    ece = _ece(p, T_val)
-    auc_p = float("nan")
-    try:
-        auc_p = float(roc_auc_score(T_val, p))
-    except Exception:
-        pass
-    return {"log_loss": ll, "ece": ece, "auc": auc_p}
+    return evaluate_propensity_predictions(p, T_val, sample_weight=sample_weight_val)
 
 
 def score_outcome_pair_on_val(
@@ -150,13 +188,17 @@ def score_outcome_pair_on_val(
     X_val: pd.DataFrame,
     T_val: np.ndarray,
     Y_val: np.ndarray,
+    sample_weight_val: np.ndarray | None = None,
 ) -> dict[str, float]:
     T_val = np.asarray(T_val).ravel()
     Y_val = np.asarray(Y_val, dtype=float).ravel()
     m1p = m1.predict(X_val)
     m0p = m0.predict(X_val)
     mT = np.where(T_val == 1, m1p, m0p)
-    mse = float(mean_squared_error(Y_val, mT))
+    kw: dict[str, Any] = {}
+    if sample_weight_val is not None:
+        kw["sample_weight"] = np.asarray(sample_weight_val, dtype=float).ravel()
+    mse = float(mean_squared_error(Y_val, mT, **kw))
     yhat = np.clip(mT, 0.0, 1.0)
     auc = 0.5
     if len(np.unique(Y_val)) >= 2:
@@ -177,6 +219,8 @@ def select_base_models(
     propensity_kinds: list[str],
     outcome_kinds: list[str],
     random_state: int,
+    sample_weight_tr: np.ndarray | None = None,
+    sample_weight_va: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """
     Returns dict with best_propensity_kind, best_outcome_kind, fitted models on train,
@@ -196,8 +240,8 @@ def select_base_models(
         except Exception as e:
             logger.warning("Skip propensity %s: %s", pk, e)
             continue
-        fitted = fit_propensity(m, X_tr, T_tr)
-        sc = score_propensity_on_val(fitted, X_va, T_va)
+        fitted = fit_propensity(m, X_tr, T_tr, sample_weight=sample_weight_tr)
+        sc = score_propensity_on_val(fitted, X_va, T_va, sample_weight_val=sample_weight_va)
         prop_scores.append({"kind": pk, **sc})
         logger.info(
             "Propensity candidate %s: val log_loss=%s ece=%s auc=%s",
@@ -228,9 +272,11 @@ def select_base_models(
             continue
         mask1 = T_tr == 1
         mask0 = T_tr == 0
-        fit_outcome_arm(m1, X_tr, Y_tr, mask1)
-        fit_outcome_arm(m0, X_tr, Y_tr, mask0)
-        sc = score_outcome_pair_on_val(m1, m0, X_va, T_va, Y_va)
+        fit_outcome_arm(m1, X_tr, Y_tr, mask1, sample_weight=sample_weight_tr)
+        fit_outcome_arm(m0, X_tr, Y_tr, mask0, sample_weight=sample_weight_tr)
+        sc = score_outcome_pair_on_val(
+            m1, m0, X_va, T_va, Y_va, sample_weight_val=sample_weight_va
+        )
         out_scores.append({"kind": ok, **sc})
         logger.info(
             "Outcome candidate %s: val mse=%s auc(Y vs m_T)=%s",
